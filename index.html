@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>NEXOR | Gerenciador</title>
+  <meta name="description" content="NEXOR Gerenciador — pedidos, orçamentos, ordens de serviço, estoque e financeiro em um só lugar.">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="theme-color" content="#0F1B2B">
+  <meta property="og:title" content="NEXOR | Gerenciador">
+  <meta property="og:description" content="Sistema de gestão: pedidos, orçamentos, OS, estoque e financeiro.">
+  <meta property="og:image" content="imagens/logo-sistema/logo-nexor.jpeg">
+  <link rel="icon" type="image/jpeg" href="imagens/logo-sistema/logo-nexor.jpeg">
+  <link rel="apple-touch-icon" href="imagens/logo-sistema/logo-nexor.jpeg">
+  <link rel="preconnect" href="https://script.google.com">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=Public+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    /* Mesma identidade visual do sistema (azul-marinho + laranja) */
+    :root {
+      --navy: #0F1B2B;
+      --navy-2: #1E354A;
+      --navy-3: #0A1320;
+      --brand: #EE7B12;
+      --brand-2: #F59E1B;
+      --ink-soft: rgba(255, 255, 255, .62);
+      --ink-faint: rgba(255, 255, 255, .38);
+      --line: rgba(255, 255, 255, .09);
+      --display: 'Bricolage Grotesque', 'Segoe UI', system-ui, sans-serif;
+      --body: 'Public Sans', 'Segoe UI', system-ui, -apple-system, sans-serif;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: var(--navy);
+      font-family: var(--body);
+      color: #fff;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .app {
+      position: relative;
+      width: 100vw;
+      height: 100vh;
+      height: 100dvh; /* celulares: desconta a barra do navegador */
+    }
+
+    .app-frame {
+      display: block;
+      width: 100%;
+      height: 100%;
+      border: 0;
+      background: #fff;
+    }
+
+    /* ---------- tela de carregamento ---------- */
+    .splash {
+      position: absolute;
+      inset: 0;
+      z-index: 10;
+      display: grid;
+      place-items: center;
+      padding: 24px 16px calc(24px + env(safe-area-inset-bottom));
+      background:
+        radial-gradient(900px 520px at 50% 38%, rgba(238, 123, 18, .10), transparent 65%),
+        radial-gradient(1200px 700px at 50% 120%, var(--navy-2), transparent 70%),
+        linear-gradient(180deg, var(--navy) 0%, var(--navy-3) 100%);
+      transition: opacity .55s ease, visibility .55s ease;
+    }
+    .splash.saiu { opacity: 0; visibility: hidden; }
+
+    /* grade sutil ao fundo */
+    .splash::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background-image:
+        linear-gradient(var(--line) 1px, transparent 1px),
+        linear-gradient(90deg, var(--line) 1px, transparent 1px);
+      background-size: 56px 56px;
+      mask-image: radial-gradient(ellipse 60% 55% at 50% 45%, #000 20%, transparent 75%);
+      -webkit-mask-image: radial-gradient(ellipse 60% 55% at 50% 45%, #000 20%, transparent 75%);
+      opacity: .55;
+      pointer-events: none;
+    }
+
+    .card {
+      position: relative;
+      width: min(420px, 100%);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      text-align: center;
+    }
+
+    .marca {
+      position: relative;
+      width: 132px;
+      height: 132px;
+      display: grid;
+      place-items: center;
+    }
+    .marca img {
+      width: 96px;
+      height: 96px;
+      border-radius: 24px;
+      object-fit: cover;
+      background: var(--navy-2);
+      box-shadow: 0 20px 44px rgba(0, 0, 0, .5), 0 0 0 1px rgba(255, 255, 255, .08);
+    }
+    /* anel de progresso em volta da logo */
+    .marca svg { position: absolute; inset: 0; width: 100%; height: 100%; transform: rotate(-90deg); }
+    .marca .trilho { stroke: rgba(255, 255, 255, .08); }
+    .marca .arco {
+      stroke: url(#grad);
+      stroke-linecap: round;
+      stroke-dasharray: 90 400;
+      animation: girar 1.4s cubic-bezier(.5, .1, .5, .9) infinite;
+      transform-origin: 50% 50%;
+    }
+    @keyframes girar { to { transform: rotate(360deg); } }
+
+    h1 {
+      margin-top: 30px;
+      font-family: var(--display);
+      font-size: clamp(26px, 6vw, 32px);
+      font-weight: 700;
+      letter-spacing: .5px;
+      line-height: 1.1;
+    }
+    h1 span { color: var(--brand-2); font-weight: 600; }
+
+    .slogan {
+      margin-top: 8px;
+      color: var(--ink-soft);
+      font-size: 14px;
+    }
+
+    .barra {
+      width: min(280px, 80%);
+      height: 4px;
+      margin-top: 34px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, .08);
+      overflow: hidden;
+    }
+    .barra i {
+      display: block;
+      height: 100%;
+      width: 0;
+      border-radius: inherit;
+      background: linear-gradient(90deg, var(--brand), var(--brand-2));
+      box-shadow: 0 0 14px rgba(238, 123, 18, .55);
+      transition: width .5s ease;
+    }
+
+    .status {
+      min-height: 20px;
+      margin-top: 14px;
+      color: var(--ink-faint);
+      font-size: 13px;
+    }
+
+    /* aviso de demora / sem internet */
+    .aviso {
+      width: 100%;
+      margin-top: 26px;
+      padding: 16px 18px;
+      border: 1px solid rgba(245, 158, 27, .35);
+      border-radius: 14px;
+      background: rgba(238, 123, 18, .08);
+      text-align: left;
+    }
+    .aviso[hidden] { display: none; }
+    .aviso b { display: block; font-size: 14px; margin-bottom: 4px; }
+    .aviso p { color: var(--ink-soft); font-size: 13px; line-height: 1.5; }
+    .acoes { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
+    .btn {
+      flex: 1 1 140px;
+      min-height: 40px;
+      padding: 0 16px;
+      border: 1px solid transparent;
+      border-radius: 999px;
+      font: 600 13px var(--body);
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      transition: background .15s, border-color .15s;
+    }
+    .btn.pri { background: var(--brand); color: #fff; }
+    .btn.pri:hover { background: var(--brand-2); }
+    .btn.sec { background: transparent; color: #fff; border-color: rgba(255, 255, 255, .22); }
+    .btn.sec:hover { border-color: rgba(255, 255, 255, .45); }
+    .btn:focus-visible { outline: 2px solid var(--brand-2); outline-offset: 2px; }
+
+    .rodape {
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: calc(18px + env(safe-area-inset-bottom));
+      display: flex;
+      justify-content: center;
+      gap: 8px;
+      color: var(--ink-faint);
+      font-size: 11.5px;
+      letter-spacing: .4px;
+    }
+    .rodape .ponto { opacity: .6; }
+    .seguro { display: inline-flex; align-items: center; gap: 5px; }
+    .seguro svg { width: 12px; height: 12px; stroke: currentColor; fill: none; stroke-width: 2; }
+
+    @media (max-height: 560px) {
+      .marca { width: 104px; height: 104px; }
+      .marca img { width: 74px; height: 74px; border-radius: 18px; }
+      h1 { margin-top: 18px; }
+      .barra { margin-top: 22px; }
+      .rodape { display: none; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .marca .arco { animation-duration: 4s; }
+      .barra i, .splash { transition: none; }
+    }
+  </style>
+</head>
+<body>
+
+  <main class="app">
+    <section id="splash" class="splash" aria-live="polite" aria-busy="true">
+      <div class="card">
+        <div class="marca">
+          <svg viewBox="0 0 132 132" aria-hidden="true">
+            <defs>
+              <linearGradient id="grad" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0" stop-color="#EE7B12"/>
+                <stop offset="1" stop-color="#F59E1B"/>
+              </linearGradient>
+            </defs>
+            <circle class="trilho" cx="66" cy="66" r="62" fill="none" stroke-width="3"/>
+            <circle class="arco" cx="66" cy="66" r="62" fill="none" stroke-width="3"/>
+          </svg>
+          <img src="imagens/logo-sistema/logo-nexor.jpeg" alt="Logotipo NEXOR" width="96" height="96">
+        </div>
+
+        <h1>NEXOR <span>Gerenciador</span></h1>
+        <p class="slogan">Pedidos, orçamentos, OS, estoque e financeiro em um só lugar</p>
+
+        <div class="barra" role="progressbar" aria-label="Carregando o sistema" aria-valuemin="0" aria-valuemax="100">
+          <i id="barra"></i>
+        </div>
+        <p id="status" class="status">Conectando ao servidor…</p>
+
+        <div id="aviso" class="aviso" hidden>
+          <b id="avisoTitulo">Está demorando mais que o normal</b>
+          <p id="avisoTexto">O servidor do Google pode estar lento. Você pode aguardar mais um pouco, tentar de novo ou abrir o sistema direto em uma nova aba.</p>
+          <div class="acoes">
+            <button id="tentar" class="btn pri" type="button">Tentar novamente</button>
+            <a id="novaAba" class="btn sec" target="_blank" rel="noopener">Abrir em nova aba</a>
+          </div>
+        </div>
+      </div>
+
+      <div class="rodape">
+        <span class="seguro"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>Conexão segura</span>
+        <span class="ponto">·</span>
+        <span>NEXOR © <span id="ano">2026</span></span>
+      </div>
+    </section>
+
+    <iframe
+      id="app"
+      class="app-frame"
+      title="NEXOR Gerenciador"
+      allow="geolocation; microphone; camera; clipboard-write"
+      referrerpolicy="strict-origin-when-cross-origin"></iframe>
+  </main>
+
+  <script>
+    (function () {
+      // Endereço do App da Web (Implantar > Gerenciar implantações > URL do App da Web)
+      var URL_APP = 'https://script.google.com/macros/s/AKfycbwq8GIjliT10jzVGUe3g9EUCbEPZnBy20Rp13-lC6uQoCl45l7fwVv6_mqXdwL9eU7a/exec';
+
+      var $ = function (id) { return document.getElementById(id); };
+      var splash = $('splash'), frame = $('app'), barra = $('barra'), status = $('status'), aviso = $('aviso');
+      var etapas = [
+        [0,     8,  'Conectando ao servidor…'],
+        [1500,  35, 'Carregando módulos…'],
+        [4000,  62, 'Preparando seus dados…'],
+        [8000,  82, 'Quase pronto…'],
+        [13000, 92, 'Finalizando…']
+      ];
+      var timers = [], pronto = false;
+
+      $('ano').textContent = new Date().getFullYear();
+      $('novaAba').href = URL_APP;
+
+      function limpar() { timers.forEach(clearTimeout); timers = []; }
+
+      function mostrarAviso(titulo, texto) {
+        $('avisoTitulo').textContent = titulo;
+        $('avisoTexto').textContent = texto;
+        aviso.hidden = false;
+      }
+
+      function carregar() {
+        limpar();
+        pronto = false;
+        aviso.hidden = true;
+        splash.classList.remove('saiu');
+        splash.setAttribute('aria-busy', 'true');
+        if (!navigator.onLine) {
+          barra.style.width = '0';
+          status.textContent = 'Sem conexão com a internet.';
+          mostrarAviso('Você está sem internet', 'Verifique o Wi-Fi ou os dados móveis. O sistema abre sozinho assim que a conexão voltar.');
+          return;
+        }
+        etapas.forEach(function (e) {
+          timers.push(setTimeout(function () { if (!pronto) { barra.style.width = e[1] + '%'; status.textContent = e[2]; } }, e[0]));
+        });
+        // Demorou demais: oferece alternativas em vez de deixar a tela parada
+        timers.push(setTimeout(function () {
+          if (!pronto) mostrarAviso('Está demorando mais que o normal', 'O servidor do Google pode estar lento. Você pode aguardar mais um pouco, tentar de novo ou abrir o sistema direto em uma nova aba.');
+        }, 18000));
+        frame.src = URL_APP + (frame.src ? (URL_APP.indexOf('?') < 0 ? '?' : '&') + 't=' + Date.now() : '');
+      }
+
+      frame.addEventListener('load', function () {
+        if (!frame.src || pronto) return;
+        pronto = true;
+        limpar();
+        barra.style.width = '100%';
+        status.textContent = 'Pronto!';
+        splash.setAttribute('aria-busy', 'false');
+        setTimeout(function () { splash.classList.add('saiu'); frame.focus(); }, 350);
+      });
+
+      $('tentar').addEventListener('click', carregar);
+      window.addEventListener('online', function () { if (!pronto) carregar(); });
+      window.addEventListener('offline', function () {
+        if (!pronto) { limpar(); status.textContent = 'Sem conexão com a internet.'; mostrarAviso('Você está sem internet', 'Verifique o Wi-Fi ou os dados móveis. O sistema abre sozinho assim que a conexão voltar.'); }
+      });
+
+      carregar();
+    })();
+  </script>
+
+</body>
+</html>
