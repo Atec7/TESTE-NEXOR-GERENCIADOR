@@ -1,0 +1,2471 @@
+/**
+ * ============================================================================
+ *  ORÇAMENTOS & CAIXA — Sistema de Orçamento / Controle Financeiro
+ *  Google Apps Script + Google Sheets
+ * ============================================================================
+ *  INSTALAÇÃO
+ *   1. Crie um projeto em script.google.com (ou Extensões > Apps Script, dentro
+ *      de uma planilha). Cole este arquivo como "script.gs".
+ *   2. Crie um arquivo HTML chamado "index" e cole o conteúdo de index.html.
+ *   3. Execute a função setupSistema() uma vez e autorize os acessos.
+ *      (Ela cria/atualiza todas as abas. Pode ser executada de novo sem perder dados.)
+ *   4. Implantar > Nova implantação > App da Web.
+ *        - Executar como: "Eu" (dono da planilha)
+ *        - Quem pode acessar: pessoas da sua organização (Workspace)
+ *          ou "Somente eu" para uso pessoal.
+ *
+ *  AVISO "Este aplicativo foi criado por um usuário do Google Apps Script"
+ *  Essa faixa é exibida pelo próprio Google, numa moldura que ele coloca em
+ *  volta do app — ela NÃO faz parte do index.html, então nenhum código aqui
+ *  dentro consegue removê-la. Ela só aparece quando a implantação está com
+ *  acesso "Qualquer pessoa" (anônimo). Para ficar SEM a faixa use uma das
+ *  duas opções abaixo:
+ *    a) [RECOMENDADO] Implantar > Gerenciar implantações > "Quem pode
+ *       acessar" = "Qualquer pessoa com Conta do Google", "Somente eu" ou a
+ *       sua organização (Workspace). Este sistema usa o e-mail de quem
+ *       acessa para liberar o menu, então esse também é o acesso correto.
+ *    b) Incorporar o app numa página sua (site próprio ou Google Sites) com
+ *       um <iframe> apontando para a URL /exec. Rode paginaIncorporacao()
+ *       para gerar esse HTML pronto — o doGet já usa XFrameOptionsMode.ALLOWALL.
+ *
+ *  SOBRE USUÁRIOS E PERMISSÕES
+ *   - Cada usuário cadastrado na aba "Usuários" entra com o próprio NOME e a
+ *     SENHA DE ACESSO definida no cadastro (o administrador a define).
+ *   - O login mestre (admin_usuario / admin_senha, em "Configurações") libera a
+ *     área administrativa (Usuários e Configurações).
+ *   - O primeiro Admin é o dono do script (criado no setup). Defina a senha
+ *     desse usuário em Usuários para que ele possa entrar.
+ *   - No update, usuários criados antes ficam SEM senha até que o administrador
+ *     a defina; o login avisa isso em vez de negar de forma genérica.
+ *
+ *  ARQUITETURA (modular)
+ *   - SCHEMA      : define cada aba/entidade e suas colunas. Para criar uma
+ *                   nova aba, basta adicionar uma entrada aqui e rodar setupSistema().
+ *   - HOOKS       : regras de negócio por entidade (totais, estoque, etc.).
+ *   - CRUD genérico: api_list / api_save / api_delete servem todas as entidades.
+ *   - As colunas são localizadas pelo NOME do cabeçalho, então você pode
+ *     reordenar colunas ou acrescentar colunas suas na planilha sem quebrar nada.
+ * ============================================================================
+ */
+
+const APP = { nome: 'NEXOR GERENCIADOR', versao: '2.6.0', linhas: 1000 };
+const COR = { cabecalho: '#0F1B2B', auditoria: '#F1F4F6' };
+const LARGURAS = { id: 90, text: 170, longtext: 280, money: 120, number: 100, date: 110, datetime: 140, select: 120, ref: 110, items: 220, json: 160, url: 220 };
+
+const STATUS_BAIXA_ESTOQUE = ['Concluída', 'Faturada']; // OS nesses status consomem estoque
+const STATUS_RESERVA_ESTOQUE = ['Aberta', 'Em andamento']; // OS nesses status reservam (ainda não baixaram) o material
+const STATUS_ORC_ATIVO = ['Rascunho', 'Enviado']; // orçamentos ainda em negociação: conferem o disponível
+const PERFIS = ['Admin', 'Padrão', 'Gerente', 'Financeiro', 'Operador', 'Visualizador'];
+const SIM_NAO = ['Sim', 'Não'];
+
+/**
+ * Permissões — 2 níveis efetivos:
+ *  - Admin (ou a senha mestre ARNALDO.LIMA / 159753): acesso a tudo, incluindo
+ *    Usuários e Configurações.
+ *  - Padrão e perfis antigos (Gerente/Financeiro/Operador/Visualizador): todas
+ *    as operações do dia a dia, sem usuários, sem configurações e, no caso do
+ *    Visualizador, apenas leitura.
+ * c = criar, r = ler, u = editar, d = excluir. '*' vale para qualquer entidade
+ * não listada.
+ */
+const PERM_PADRAO = {
+  pedidos: 'crud', orcamentos: 'crud', os: 'crud', financeiro: 'crud', materiais: 'crud',
+  atividades: 'crud', clientes: 'crud', fornecedores: 'crud', parceiros: 'crud', indicadores: 'r'
+};
+const PERM_SOMENTE_LEITURA = {
+  pedidos: 'r', orcamentos: 'r', os: 'r', financeiro: 'r', materiais: 'r',
+  atividades: 'r', clientes: 'r', fornecedores: 'r', parceiros: 'r', indicadores: 'r'
+};
+const PERMISSOES = {
+  Admin:        { '*': 'crud' },
+  'Padrão':     PERM_PADRAO,
+  Gerente:      PERM_PADRAO,
+  Financeiro:   Object.assign({}, PERM_SOMENTE_LEITURA, { financeiro: 'crud' }),
+  Operador:     PERM_PADRAO,
+  Visualizador: PERM_SOMENTE_LEITURA
+};
+
+const CONFIG_PADRAO = [
+  ['empresa_nome', 'Minha Empresa', 'Nome exibido nos documentos'],
+  ['empresa_documento', '', 'CNPJ / CPF'],
+  ['empresa_telefone', '', 'Telefone'],
+  ['empresa_email', '', 'E-mail de contato'],
+['empresa_endereco', '', 'Endereço'],
+  ['validade_orcamento_dias', '15', 'Validade padrão de um orçamento (dias)'],
+  ['prazo_recebimento_dias', '7', 'Prazo padrão para receber uma OS faturada (dias)'],
+  ['rodape_documentos', 'Documento interno — sem valor fiscal.', 'Texto no rodapé dos documentos'],
+  ['link_acesso', '', 'Link de acesso enviado no e-mail de boas-vindas (vazio = link do App da Web)'],
+  ['admin_usuario', 'ARNALDO.LIMA', 'Usuário mestre de administração'],
+  ['admin_senha', '159753', 'Senha mestre de administração (usada no acesso ao cadastro de usuários)']
+];
+
+/* ============================================================================
+ *  SCHEMA — abas e colunas
+ *  t (tipo): id | text | longtext | number | money | date | datetime | select | ref | items | json | url
+ * ========================================================================== */
+const C = (k, l, t, o) => Object.assign({ k: k, l: l, t: t || 'text' }, o || {});
+const AUDIT = () => [
+  C('criadoEm', 'Criado em', 'datetime', { ro: true }),
+  C('criadoPor', 'Criado por', 'text', { ro: true }),
+  C('atualizadoEm', 'Atualizado em', 'datetime', { ro: true }),
+  C('atualizadoPor', 'Atualizado por', 'text', { ro: true })
+];
+
+const SCHEMA = {
+  pedidos: {
+    sheet: 'Pedidos', titulo: 'Pedidos', singular: 'Pedido', prefix: 'PED', cor: '#2F6FB0', labelKeys: ['descricao'],
+    defaults: { status: 'Novo', prioridade: 'Normal' },
+    cols: [
+      C('id', 'ID', 'id'),
+      C('cliente', 'Cliente', 'ref', { ref: 'clientes', req: true, list: true }),
+      C('contato', 'Contato', 'text'),
+      C('descricao', 'Descrição do pedido', 'longtext', { req: true, list: true }),
+      C('prioridade', 'Prioridade', 'select', { opts: ['Baixa', 'Normal', 'Alta', 'Urgente'], list: true }),
+      C('prazo', 'Prazo desejado', 'date', { list: true }),
+      C('status', 'Status', 'select', { opts: ['Novo', 'Em análise', 'Orçado', 'Cancelado'], list: true }),
+      C('obs', 'Observações', 'longtext')
+    ].concat(AUDIT())
+  },
+  orcamentos: {
+    sheet: 'Orçamentos', titulo: 'Orçamentos', singular: 'Orçamento', prefix: 'ORC', cor: '#6B5CA5', labelKeys: ['titulo'],
+    defaults: { status: 'Rascunho', itens: '[]', desconto: 0 },
+    cols: [
+      C('id', 'ID', 'id'),
+      C('pedidoId', 'Pedido', 'ref', { ref: 'pedidos', list: true }),
+      C('cliente', 'Cliente', 'ref', { ref: 'clientes', req: true, list: true }),
+      C('titulo', 'Título / escopo', 'text', { list: true }),
+      C('itens', 'Itens (JSON)', 'items'),
+      C('subtotal', 'Subtotal', 'money', { ro: true }),
+      C('desconto', 'Desconto', 'money'),
+      C('total', 'Total', 'money', { ro: true, list: true }),
+      C('validade', 'Validade', 'date', { list: true }),
+      C('status', 'Status', 'select', { opts: ['Rascunho', 'Enviado', 'Aprovado', 'Recusado', 'Expirado'], list: true }),
+      C('obs', 'Observações', 'longtext')
+    ].concat(AUDIT())
+  },
+  os: {
+    sheet: 'Ordens de Serviço', titulo: 'Ordens de serviço', singular: 'Ordem de serviço', prefix: 'OS', cor: '#D98E04', labelKeys: [],
+    defaults: { status: 'Aberta', dataAbertura: '@hoje', itens: '[]', desconto: 0 },
+    cols: [
+      C('id', 'ID', 'id'),
+      C('orcamentoId', 'Orçamento', 'ref', { ref: 'orcamentos', list: true }),
+      C('pedidoId', 'Pedido', 'ref', { ref: 'pedidos' }),
+      C('cliente', 'Cliente', 'ref', { ref: 'clientes', req: true, list: true }),
+      C('parceiro', 'Parceiro executante', 'ref', { ref: 'parceiros', list: true }),
+      C('descricao', 'Descrição do serviço', 'longtext', { list: true }),
+      C('responsavel', 'Responsável', 'text'),
+      C('itens', 'Itens (JSON)', 'items'),
+      C('subtotal', 'Subtotal', 'money', { ro: true }),
+      C('desconto', 'Desconto', 'money'),
+      C('total', 'Total', 'money', { ro: true, list: true }),
+      C('custoMateriais', 'Custo de materiais', 'money', { ro: true }),
+      C('dataAbertura', 'Abertura', 'date'),
+      C('previsao', 'Previsão de entrega', 'date', { list: true }),
+      C('dataConclusao', 'Conclusão', 'date'),
+      C('status', 'Status', 'select', { opts: ['Aberta', 'Em andamento', 'Concluída', 'Faturada', 'Cancelada'], list: true }),
+      C('materiaisBaixados', 'Estoque baixado (JSON)', 'json', { ro: true, hidden: true }),
+      C('obs', 'Observações', 'longtext')
+    ].concat(AUDIT())
+  },
+  financeiro: {
+    sheet: 'Financeiro', titulo: 'Financeiro', singular: 'Lançamento', prefix: 'FIN', cor: '#2E7D5B', labelKeys: ['descricao'],
+    defaults: { tipo: 'Entrada', status: 'Pendente' },
+    cols: [
+      C('id', 'ID', 'id'),
+      C('tipo', 'Tipo', 'select', { opts: ['Entrada', 'Saída'], req: true, list: true }),
+      C('categoria', 'Categoria', 'select', { opts: ['Serviços', 'Materiais', 'Salários', 'Impostos', 'Aluguel', 'Outros'], list: true }),
+      C('descricao', 'Descrição', 'text', { req: true, list: true }),
+      C('parte', 'Cliente / Fornecedor', 'text', { list: true }),
+      C('osId', 'OS vinculada', 'ref', { ref: 'os' }),
+      C('valor', 'Valor', 'money', { req: true, list: true }),
+      C('vencimento', 'Vencimento', 'date', { list: true }),
+      C('dataPagamento', 'Data de pagamento', 'date'),
+      C('forma', 'Forma de pagamento', 'select', { opts: ['Pix', 'Dinheiro', 'Cartão', 'Boleto', 'Transferência'] }),
+      C('status', 'Status', 'select', { opts: ['Pendente', 'Pago', 'Cancelado'], list: true }),
+      C('obs', 'Observações', 'longtext')
+    ].concat(AUDIT())
+  },
+  materiais: {
+    sheet: 'Materiais', titulo: 'Materiais', singular: 'Material', prefix: 'MAT', cor: '#8A5A44', labelKeys: ['nome'],
+    defaults: { ativo: 'Sim', unidade: 'un', estoqueAtual: 0, estoqueMin: 0, custo: 0, preco: 0 },
+    cols: [
+      C('id', 'ID', 'id'),
+      C('sku', 'Código (SKU)', 'text', { list: true }),
+      C('nome', 'Nome', 'text', { req: true, list: true }),
+      C('categoria', 'Categoria', 'text', { list: true }),
+      C('unidade', 'Unidade', 'select', { opts: ['un', 'm', 'm²', 'kg', 'L', 'cx', 'pç'] }),
+      C('custo', 'Custo unitário', 'money', { list: true }),
+      C('preco', 'Preço de venda', 'money', { list: true }),
+      C('estoqueAtual', 'Estoque atual', 'number', { list: true }),
+      C('estoqueMin', 'Estoque mínimo', 'number', { list: true }),
+      C('fornecedor', 'Fornecedor', 'text'),
+      C('ativo', 'Ativo', 'select', { opts: SIM_NAO, list: true }),
+      C('obs', 'Observações', 'longtext')
+    ].concat(AUDIT())
+  },
+  clientes: {
+    sheet: 'Clientes', titulo: 'Clientes', singular: 'Cliente', prefix: 'CLI', cor: '#3E7CB1', labelKeys: ['nome'],
+    defaults: { ativo: 'Sim' },
+    cols: [
+      C('id', 'ID', 'id'),
+      C('nome', 'Nome / Razão social', 'text', { req: true, list: true }),
+      C('documento', 'CNPJ / CPF', 'text', { list: true }),
+      C('email', 'E-mail', 'text'),
+      C('telefone', 'Telefone', 'text', { list: true }),
+      C('celular', 'Celular / WhatsApp', 'text', { list: true }),
+      C('endereco', 'Endereço', 'longtext'),
+      C('cidade', 'Cidade / UF', 'text', { list: true }),
+      C('contato', 'Pessoa de contato', 'text'),
+      C('origem', 'Origem', 'select', { opts: ['Indicação', 'Site', 'Anúncio', 'Prospecção', 'Outros'], list: true }),
+      C('ativo', 'Ativo', 'select', { opts: SIM_NAO, list: true }),
+      C('obs', 'Observações', 'longtext')
+    ].concat(AUDIT())
+  },
+  fornecedores: {
+    sheet: 'Fornecedores', titulo: 'Fornecedores', singular: 'Fornecedor', prefix: 'FOR', cor: '#7A5C4F', labelKeys: ['nome'],
+    defaults: { ativo: 'Sim' },
+    cols: [
+      C('id', 'ID', 'id'),
+      C('nome', 'Razão social / Nome', 'text', { req: true, list: true }),
+      C('documento', 'CNPJ / CPF', 'text', { list: true }),
+      C('email', 'E-mail', 'text'),
+      C('telefone', 'Telefone', 'text', { list: true }),
+      C('endereco', 'Endereço', 'longtext'),
+      C('cidade', 'Cidade / UF', 'text'),
+      C('prazos', 'Prazo de entrega / pagamento', 'text'),
+      C('ativo', 'Ativo', 'select', { opts: SIM_NAO, list: true }),
+      C('obs', 'Observações', 'longtext')
+    ].concat(AUDIT())
+  },
+  usuarios: {
+    sheet: 'Usuários', titulo: 'Usuários', singular: 'Usuário', prefix: 'USR', cor: '#5B6B7A', labelKeys: ['nome'],
+    defaults: { perfil: 'Padrão', ativo: 'Sim', recebeEmailEstoque: 'Não' },
+    cols: [
+      C('id', 'ID', 'id'),
+      C('nome', 'Nome', 'text', { req: true, list: true }),
+      C('email', 'E-mail', 'email', { list: false }),
+      C('recebeEmailEstoque', 'Receber alertas de estoque por e-mail', 'checkbox', { list: false }),
+      C('senha', 'Senha de acesso', 'password', { req: true, list: false }),
+      C('senhaHash', 'Hash da senha', 'text', { ro: true, hidden: true, list: false }),
+      C('fotoId', 'Foto de perfil (Drive ID)', 'text', { ro: true, hidden: true, list: false }),
+      C('perfil', 'Perfil', 'select', { opts: PERFIS, req: true, list: true }),
+      C('ativo', 'Ativo', 'select', { opts: SIM_NAO, list: true }),
+      C('obs', 'Observações', 'longtext')
+    ].concat(AUDIT())
+  },
+  parceiros: {
+    sheet: 'Parceiros', titulo: 'Parceiros', singular: 'Parceiro', prefix: 'PAR', cor: '#8A6D3B', labelKeys: ['nome'],
+    defaults: { ativo: 'Sim' },
+    cols: [
+      C('id', 'ID', 'id'),
+      C('nome', 'Nome completo', 'text', { req: true, list: true }),
+      C('cpf', 'CPF', 'text', { list: true }),
+      C('whatsapp', 'WhatsApp', 'text', { list: true }),
+      C('email', 'E-mail', 'text'),
+      C('endereco', 'Endereço', 'longtext'),
+      C('cidade', 'Cidade', 'text'),
+      C('especialidade', 'Especialidade / Serviço', 'text', { list: true }),
+      C('contatoEmergencia', 'Contato de emergência', 'text'),
+      C('telefoneEmergencia', 'Telefone de emergência', 'text'),
+      C('obs', 'Observações', 'longtext'),
+      C('ativo', 'Ativo', 'select', { opts: SIM_NAO, list: true })
+    ].concat(AUDIT())
+  },
+  atividades: {
+    sheet: 'Atividades', titulo: 'Atividades', singular: 'Atividade', prefix: 'ATV', cor: '#4E8A5B', labelKeys: ['descricao'],
+    defaults: { unidade: 'un', ativo: 'Sim' },
+    cols: [
+      C('id', 'ID', 'id'),
+      C('codigo', 'Código (5 dígitos)', 'text', { ro: true, list: true }),
+      C('descricao', 'Descrição', 'text', { req: true, list: true }),
+      C('unidade', 'Unidade', 'select', { opts: ['un', 'h', 'm', 'm²', 'kg', 'L', 'cx', 'pç', 'serv'], list: true }),
+      C('valor', 'Valor unitário', 'money', { list: true }),
+      C('ativo', 'Ativo', 'select', { opts: SIM_NAO, list: true }),
+      C('obs', 'Observações', 'longtext')
+    ].concat(AUDIT())
+  },
+  movimentacoes: {
+    sheet: 'Movimentações', titulo: 'Movimentações de estoque', singular: 'Movimentação', prefix: 'MOV', cor: '#B0B8C0',
+    readonly: true, permAs: 'materiais', labelKeys: ['material'],
+    cols: [
+      C('id', 'ID', 'id'),
+      C('data', 'Data/hora', 'datetime', { ro: true, list: true }),
+      C('materialId', 'Material', 'ref', { ref: 'materiais', ro: true, list: true }),
+      C('material', 'Nome', 'text', { ro: true, list: true }),
+      C('tipo', 'Tipo', 'select', { opts: ['Entrada', 'Saída', 'Ajuste', 'Estorno'], ro: true, list: true }),
+      C('quantidade', 'Quantidade', 'number', { ro: true, list: true }),
+      C('saldo', 'Saldo após', 'number', { ro: true, list: true }),
+      C('origem', 'Origem', 'text', { ro: true, list: true }),
+      C('usuario', 'Usuário', 'text', { ro: true, list: true })
+    ]
+  }
+};
+
+const ORDEM_ABAS = ['Pedidos', 'Orçamentos', 'Ordens de Serviço', 'Financeiro', 'Clientes', 'Parceiros', 'Fornecedores', 'Materiais', 'Atividades', 'Indicadores', 'Usuários', 'Movimentações', 'Config'];
+
+/* ============================================================================
+ *  REGRAS DE NEGÓCIO (hooks) — executam dentro do salvamento
+ * ========================================================================== */
+const HOOKS = {
+  orcamentos: {
+    before: function (d, prev) {
+      calcTotais_(d, false);
+      if (precisaConferirEstoque_(d, prev, STATUS_ORC_ATIVO)) validarDisponibilidade_(d.itens, null, 'Orçamento');
+    }
+  },
+  os: {
+    before: function (d, prev, user) {
+      calcTotais_(d, true);
+      if (d.previsao && d.dataAbertura && String(d.previsao) < String(d.dataAbertura)) throw new Error('A previsão de entrega não pode ser anterior à data de abertura.');
+      if (d.dataConclusao && d.dataAbertura && String(d.dataConclusao) < String(d.dataAbertura)) throw new Error('A data de conclusão não pode ser anterior à data de abertura.');
+      if (precisaConferirEstoque_(d, prev, STATUS_RESERVA_ESTOQUE)) validarDisponibilidade_(d.itens, d.id, 'OS');
+      syncEstoqueOS_(d, user);
+      if (STATUS_BAIXA_ESTOQUE.indexOf(d.status) >= 0 && !d.dataConclusao) d.dataConclusao = hoje_();
+    },
+    beforeDelete: function (prev, user) {
+      // Ao excluir uma OS, devolve ao estoque o que ela havia consumido.
+      syncEstoqueOS_(Object.assign({}, prev, { status: 'Cancelada' }), user);
+    }
+  },
+  financeiro: {
+    before: function (d) {
+      d.valor = num_(d.valor);
+      if (d.valor <= 0) throw new Error('O valor do lançamento deve ser maior que zero.');
+      if (d.status === 'Pago' && !d.dataPagamento) d.dataPagamento = hoje_();
+    }
+  },
+  materiais: {
+    before: function (d) {
+      ['custo', 'preco', 'estoqueAtual', 'estoqueMin'].forEach(function (k) { d[k] = num_(d[k]); });
+      if (d.estoqueAtual < 0) throw new Error('O estoque atual não pode ser negativo.');
+      if (d.estoqueMin < 0) throw new Error('O estoque mínimo não pode ser negativo.');
+      if (d.custo < 0 || d.preco < 0) throw new Error('Custo e preço de venda não podem ser negativos.');
+    },
+    beforeDelete: function (prev) {
+      const usos = [];
+      readAll_('os').forEach(function (o) {
+        if (STATUS_RESERVA_ESTOQUE.indexOf(o.status) >= 0 && somaMateriais_(o.itens)[prev.id]) usos.push(o.id);
+      });
+      readAll_('orcamentos').forEach(function (o) {
+        if (STATUS_ORC_ATIVO.indexOf(o.status) >= 0 && somaMateriais_(o.itens)[prev.id]) usos.push(o.id);
+      });
+      if (usos.length) throw new Error('Este material está em uso em ' + usos.join(', ') + '. Conclua/cancele esses registros ou marque o material como inativo (Ativo = Não).');
+    },
+    after: function (d, prev, user) {
+      const novo = num_(d.estoqueAtual), ant = prev ? num_(prev.estoqueAtual) : 0;
+      if (novo !== ant) logMov_(d, prev ? 'Ajuste' : 'Entrada', round3_(novo - ant), novo, prev ? 'Edição manual' : 'Estoque inicial', user);
+    }
+  },
+  atividades: {
+    before: function (d, prev) {
+      d.valor = num_(d.valor);
+      if (!prev && !d.codigo) d.codigo = nextCodigo5_('atividades');
+    }
+  },
+  usuarios: {
+    before: function (d, prev) {
+      d.nome = String(d.nome || '').trim();
+      if (!d.nome) throw new Error('Informe o nome do usuário.');
+      d.email = String(d.email || '').trim();
+      if (d.email && !/^\S+@\S+\.\S+$/.test(d.email)) throw new Error('Informe um e-mail válido para o usuário.');
+      d.recebeEmailEstoque = d.recebeEmailEstoque === true || ['sim', 'true', 'on'].indexOf(String(d.recebeEmailEstoque || '').toLowerCase()) >= 0 ? 'Sim' : 'Não';
+      if (d.recebeEmailEstoque === 'Sim' && !d.email) throw new Error('Informe o e-mail do usuário para ativar os alertas de estoque.');
+      const duplicado = readAll_('usuarios').some(function (u) { return u.id !== d.id && String(u.nome).trim().toLowerCase() === d.nome.toLowerCase(); });
+      if (duplicado) throw new Error('Esse nome de usuário já está em uso.');
+      if (prev && !d.senha) {
+        d.senha = String(prev.senha || '');
+        d.senhaHash = String(prev.senhaHash || '');
+      }
+      if (d.senha) {
+        if (String(d.senha).length < 8) throw new Error('A senha deve ter pelo menos 8 caracteres.');
+        d.senhaHash = hashSenha_(String(d.senha));
+        d.senha = '';
+      }
+      if (!d.senhaHash && !d.senha) throw new Error('Defina a senha de acesso do usuário.');
+      if (PERFIS.indexOf(d.perfil) < 0) throw new Error('Perfil inválido.');
+      const outros = readAll_('usuarios').filter(function (u) { return u.id !== d.id; });
+      const seraAdmin = d.perfil === 'Admin' && d.ativo !== 'Não';
+      if (!seraAdmin && !outros.some(function (u) { return u.perfil === 'Admin' && u.ativo !== 'Não'; })) {
+        throw new Error('É necessário manter ao menos um administrador ativo.');
+      }
+    },
+    beforeDelete: function (prev) {
+      const outros = readAll_('usuarios').filter(function (u) { return u.id !== prev.id; });
+      if (!outros.some(function (u) { return u.perfil === 'Admin' && u.ativo !== 'Não'; })) {
+        throw new Error('Não é possível excluir o único administrador.');
+      }
+    }
+  },
+  clientes: {
+    before: function (d) {
+      const email = String(d.email || '').trim();
+      if (email && !/^\S+@\S+\.\S+$/.test(email)) throw new Error('Informe um e-mail válido no cadastro do cliente.');
+      if (String(d.documento || '').trim()) d.documento = String(d.documento).replace(/[^\d./-]/g, '');
+    },
+    beforeDelete: function (prev) {
+      ['pedidos', 'orcamentos', 'os'].forEach(function (e) {
+        const usados = readAll_(e).filter(function (r) { return String(r.cliente) === String(prev.id); });
+        if (usados.length) throw new Error('O cliente está vinculado a ' + usados.length + ' registro(s) em ' + SCHEMA[e].titulo.toLowerCase() + '. Edite-os antes de excluir.');
+      });
+    }
+  }
+};
+
+/* ============================================================================
+ *  SETUP — cria e atualiza planilha, abas, cabeçalhos, formatação e validações
+ * ========================================================================== */
+
+/** Menu dentro da planilha (quando o script é vinculado a ela). */
+function onOpen() {
+  try {
+    SpreadsheetApp.getUi().createMenu(APP.nome)
+      .addItem('Configurar / atualizar abas', 'setupSistema')
+      .addItem('Recriar aba Indicadores', 'atualizarIndicadores')
+      .addSeparator()
+      .addItem('Autorizar envio de e-mails', 'autorizarEnvioEmails')
+      .addToUi();
+  } catch (e) { /* fora de planilha */ }
+}
+
+/**
+ * Execute uma vez (menu da planilha ou editor do Apps Script) logado como DONO
+ * do script: o Google abre a tela "Permitir" e libera o envio de e-mails.
+ */
+function autorizarEnvioEmails() {
+  const restante = MailApp.getRemainingDailyQuota();
+  const msg = 'Envio de e-mails autorizado. Restam ' + restante + ' envio(s) hoje.';
+  Logger.log(msg);
+  try { SpreadsheetApp.getUi().alert(msg); } catch (e) { /* rodando pelo editor */ }
+  return restante;
+}
+
+/**
+ * Execute uma vez (e sempre que alterar o SCHEMA). Idempotente: não apaga dados.
+ * Roda sob lock para que duas abas abertas ao mesmo tempo não disputem a
+ * criação de abas (ex.: "Já existe uma página chamada 'Atividades'").
+ */
+function setupSistema() {
+  return withLock_(function () {
+    const ss = getSS_();
+    Object.keys(SCHEMA).forEach(function (k) { ensureSheet_(ss, k); });
+    ensureConfig_(ss);
+    migrarClientes_(); // transforma clientes digitados à mão (texto) em cadastros reais
+    Object.keys(SCHEMA).forEach(function (k) { formatSheet_(ss, k); }); // depois de criar todas (validações entre abas)
+    ensureIndicadores_(ss);
+    ordenarAbas_(ss);
+    removerAbaPadrao_(ss);
+    removerAbaDocumentos_(ss); // a aba "Documentos" não é mais usada — some sozinha no setup
+    ensureFirstUser_();
+    garantirPastasImagens_();
+    PropertiesService.getScriptProperties().setProperty('SETUP', APP.versao);
+    return ss.getUrl();
+  });
+}
+
+function atualizarIndicadores() { ensureIndicadores_(getSS_()); }
+
+function ensureSetup_() {
+  if (PropertiesService.getScriptProperties().getProperty('SETUP') !== APP.versao) {
+    try { withLock_(setupSistema); }
+    catch (e) {
+      // outra execução já está configurando (lock ocupado por até 20 s): só ignora se ela terminou
+      if (PropertiesService.getScriptProperties().getProperty('SETUP') !== APP.versao) throw e;
+    }
+  }
+}
+
+let SS_CACHE = null;
+function getSS_() {
+  if (SS_CACHE) return SS_CACHE;
+  const props = PropertiesService.getScriptProperties();
+  const id = props.getProperty('SS_ID');
+  if (id) { try { SS_CACHE = SpreadsheetApp.openById(id); return SS_CACHE; } catch (e) { /* recria abaixo */ } }
+  let ss = null;
+  try { ss = SpreadsheetApp.getActiveSpreadsheet(); } catch (e) { /* script independente */ }
+  if (!ss) ss = SpreadsheetApp.create(APP.nome + ' — Dados');
+  props.setProperty('SS_ID', ss.getId());
+  SS_CACHE = ss;
+  return ss;
+}
+
+function ensureSheet_(ss, entity) {
+  const def = SCHEMA[entity];
+  const sh = getAba_(ss, def.sheet) || ss.insertSheet(def.sheet);
+  const labels = def.cols.map(function (c) { return c.l; });
+  const n = sh.getLastColumn();
+  let headers = n ? sh.getRange(1, 1, 1, n).getValues()[0].map(function (x) { return String(x).trim(); }) : [];
+  if (!headers.some(function (x) { return x; })) {
+    sh.getRange(1, 1, 1, labels.length).setValues([labels]);
+  } else {
+    // migração: acrescenta ao final colunas novas do SCHEMA que ainda não existem
+    labels.forEach(function (l) {
+      if (headers.indexOf(l) < 0) { headers.push(l); sh.getRange(1, headers.length).setValue(l); }
+    });
+  }
+  MEMO_.cab = {}; MEMO_.linhas = {}; // cabeçalhos podem ter mudado
+}
+
+function formatSheet_(ss, entity) {
+  const def = SCHEMA[entity];
+  const sh = getAba_(ss, def.sheet);
+  const map = headerMap_(sh);
+  const n = sh.getLastColumn();
+  if (sh.getMaxRows() < APP.linhas) sh.insertRowsAfter(sh.getMaxRows(), APP.linhas - sh.getMaxRows());
+  sh.getRange(1, 1, 1, n).setBackground(COR.cabecalho).setFontColor('#FFFFFF').setFontWeight('bold').setVerticalAlignment('middle');
+  sh.setFrozenRows(1);
+  sh.setFrozenColumns(1);
+  if (def.cor) sh.setTabColor(def.cor);
+
+  def.cols.forEach(function (c) {
+    const i = map[c.l];
+    if (i === undefined) return;
+    const col = i + 1;
+    const rng = sh.getRange(2, col, APP.linhas - 1, 1);
+    if (c.t === 'money') rng.setNumberFormat('"R$" #,##0.00');
+    else if (c.t === 'date') rng.setNumberFormat('dd/MM/yyyy');
+    else if (c.t === 'datetime') rng.setNumberFormat('dd/MM/yyyy HH:mm');
+    if (c.t === 'select') {
+      rng.setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(c.opts, true).setAllowInvalid(true).build());
+    }
+    if (c.t === 'checkbox') {
+      rng.setDataValidation(SpreadsheetApp.newDataValidation().requireCheckbox('Sim', 'Não').build());
+    }
+    if (c.t === 'ref') {
+      const refDef = SCHEMA[c.ref];
+      const refSh = getAba_(ss, refDef.sheet);
+      const idCol = headerMap_(refSh)['ID'];
+      const L = letter_(idCol + 1);
+      rng.setDataValidation(SpreadsheetApp.newDataValidation()
+        .requireValueInRange(refSh.getRange(L + '2:' + L + APP.linhas), true).setAllowInvalid(true).build());
+    }
+    if (c.ro) rng.setBackground(COR.auditoria);
+    sh.setColumnWidth(col, c.w || LARGURAS[c.t] || 140);
+    if (c.hidden) sh.hideColumns(col);
+  });
+}
+
+function ensureConfig_(ss) {
+  const sh = getAba_(ss, 'Config') || ss.insertSheet('Config');
+  if (sh.getLastRow() < 1) {
+    sh.getRange(1, 1, 1, 3).setValues([['Chave', 'Valor', 'Descrição']])
+      .setBackground(COR.cabecalho).setFontColor('#FFFFFF').setFontWeight('bold');
+    sh.setFrozenRows(1);
+    sh.setColumnWidth(1, 200); sh.setColumnWidth(2, 260); sh.setColumnWidth(3, 380);
+    sh.setTabColor('#B0B8C0');
+  }
+  const existentes = sh.getLastRow() > 1 ? sh.getRange(2, 1, sh.getLastRow() - 1, 1).getValues().map(function (r) { return r[0]; }) : [];
+  CONFIG_PADRAO.forEach(function (p) {
+    if (existentes.indexOf(p[0]) < 0) sh.appendRow(p);
+  });
+  limparCacheConfig_();
+}
+
+/** Aba Indicadores: fórmulas vivas do Sheets (a interface web calcula os seus próprios indicadores). */
+function ensureIndicadores_(ss) {
+  const sh = getAba_(ss, 'Indicadores') || ss.insertSheet('Indicadores');
+  const R = rng_;
+  const linhas = [
+    { sec: 'Operacional' },
+    ['Pedidos aguardando orçamento', '=SUM(COUNTIF(' + R('pedidos', 'status') + ',{"Novo","Em análise"}))', '0', 'Pedidos com status Novo ou Em análise'],
+    ['Clientes ativos', '=COUNTIF(' + R('clientes', 'ativo') + ',"Sim")', '0', 'Clientes cadastrados e ativos'],
+    ['Orçamentos em aberto', '=SUM(COUNTIF(' + R('orcamentos', 'status') + ',{"Rascunho","Enviado"}))', '0', 'Rascunhos e enviados, ainda sem decisão'],
+    ['Valor em orçamentos abertos', '=SUMIF(' + R('orcamentos', 'status') + ',"Rascunho",' + R('orcamentos', 'total') + ')+SUMIF(' + R('orcamentos', 'status') + ',"Enviado",' + R('orcamentos', 'total') + ')', '"R$" #,##0.00', 'Soma dos totais dos orçamentos em aberto'],
+    ['Taxa de conversão de orçamentos', '=IFERROR(COUNTIF(' + R('orcamentos', 'status') + ',"Aprovado")/(COUNTA(' + R('orcamentos', 'id') + ')-COUNTIF(' + R('orcamentos', 'status') + ',"Rascunho")),0)', '0.0%', 'Aprovados ÷ orçamentos já enviados ao cliente'],
+    ['OS em execução', '=SUM(COUNTIF(' + R('os', 'status') + ',{"Aberta","Em andamento"}))', '0', 'Ordens Abertas ou Em andamento'],
+    ['OS concluídas / faturadas', '=SUM(COUNTIF(' + R('os', 'status') + ',{"Concluída","Faturada"}))', '0', 'Ordens finalizadas'],
+    ['Valor das OS concluídas', '=SUMIF(' + R('os', 'status') + ',"Concluída",' + R('os', 'total') + ')+SUMIF(' + R('os', 'status') + ',"Faturada",' + R('os', 'total') + ')', '"R$" #,##0.00', 'Total de OS Concluídas + Faturadas'],
+    ['Margem estimada sobre materiais', '=IFERROR(1-(SUMIF(' + R('os', 'status') + ',"Concluída",' + R('os', 'custoMateriais') + ')+SUMIF(' + R('os', 'status') + ',"Faturada",' + R('os', 'custoMateriais') + '))/(SUMIF(' + R('os', 'status') + ',"Concluída",' + R('os', 'total') + ')+SUMIF(' + R('os', 'status') + ',"Faturada",' + R('os', 'total') + ')),0)', '0.0%', '1 − custo de materiais ÷ valor das OS (não inclui mão de obra)'],
+    { sec: 'Financeiro' },
+    ['Total recebido', '=SUMIFS(' + R('financeiro', 'valor') + ',' + R('financeiro', 'tipo') + ',"Entrada",' + R('financeiro', 'status') + ',"Pago")', '"R$" #,##0.00', 'Entradas com status Pago'],
+    ['A receber', '=SUMIFS(' + R('financeiro', 'valor') + ',' + R('financeiro', 'tipo') + ',"Entrada",' + R('financeiro', 'status') + ',"Pendente")', '"R$" #,##0.00', 'Entradas pendentes'],
+    ['Despesas pagas', '=SUMIFS(' + R('financeiro', 'valor') + ',' + R('financeiro', 'tipo') + ',"Saída",' + R('financeiro', 'status') + ',"Pago")', '"R$" #,##0.00', 'Saídas com status Pago'],
+    ['A pagar', '=SUMIFS(' + R('financeiro', 'valor') + ',' + R('financeiro', 'tipo') + ',"Saída",' + R('financeiro', 'status') + ',"Pendente")', '"R$" #,##0.00', 'Saídas pendentes'],
+    ['Saldo de caixa', '=SUMIFS(' + R('financeiro', 'valor') + ',' + R('financeiro', 'tipo') + ',"Entrada",' + R('financeiro', 'status') + ',"Pago")-SUMIFS(' + R('financeiro', 'valor') + ',' + R('financeiro', 'tipo') + ',"Saída",' + R('financeiro', 'status') + ',"Pago")', '"R$" #,##0.00', 'Recebido − pago'],
+    { sec: 'Estoque' },
+    ['Materiais abaixo do mínimo', '=SUMPRODUCT((' + R('materiais', 'id') + '<>"")*(' + R('materiais', 'estoqueAtual') + '<=' + R('materiais', 'estoqueMin') + ')*(((' + R('materiais', 'estoqueMin') + '>0)+(' + R('materiais', 'estoqueAtual') + '<0))>0))', '0', 'Estoque atual ≤ mínimo'],
+    ['Valor em estoque (custo)', '=SUMPRODUCT(' + R('materiais', 'estoqueAtual') + ',' + R('materiais', 'custo') + ')', '"R$" #,##0.00', 'Estoque atual × custo unitário']
+  ];
+
+  sh.clear();
+  sh.getRange(1, 1, 1, 3).setValues([['Indicador', 'Valor', 'O que mede']])
+    .setBackground(COR.cabecalho).setFontColor('#FFFFFF').setFontWeight('bold');
+  const a = [], b = [], f = [], nota = [];
+  linhas.forEach(function (l) {
+    if (l.sec) { a.push([l.sec]); b.push(['']); f.push(['']); nota.push(['']); }
+    else { a.push([l[0]]); b.push([l[1]]); f.push([l[2]]); nota.push([l[3]]); }
+  });
+  const n = linhas.length;
+  sh.getRange(2, 1, n, 1).setValues(a);
+  sh.getRange(2, 2, n, 1).setFormulas(b).setNumberFormats(f).setHorizontalAlignment('right');
+  sh.getRange(2, 3, n, 1).setValues(nota).setFontColor('#5B6B7A');
+  linhas.forEach(function (l, i) {
+    if (l.sec) sh.getRange(i + 2, 1, 1, 3).setBackground('#DDE4EC').setFontWeight('bold');
+  });
+  sh.setColumnWidth(1, 280); sh.setColumnWidth(2, 150); sh.setColumnWidth(3, 430);
+  sh.setFrozenRows(1);
+  sh.setTabColor('#0F1B2B');
+  sh.getRange(n + 3, 1).setValue('Aba calculada automaticamente — não edite. É recriada por "Configurar / atualizar abas".').setFontColor('#8A97A3').setFontStyle('italic');
+}
+
+function ordenarAbas_(ss) {
+  ORDEM_ABAS.forEach(function (nome, i) {
+    const sh = getAba_(ss, nome);
+    if (sh) { ss.setActiveSheet(sh); ss.moveActiveSheet(i + 1); }
+  });
+  const primeira = getAba_(ss, ORDEM_ABAS[0]);
+  if (primeira) ss.setActiveSheet(primeira);
+}
+
+function removerAbaPadrao_(ss) {
+  ['Página1', 'Sheet1', 'Planilha1'].forEach(function (nome) {
+    const sh = getAba_(ss, nome);
+    if (sh && ss.getSheets().length > 1 && sh.getLastRow() <= 1 && sh.getLastColumn() <= 1) ss.deleteSheet(sh);
+  });
+}
+
+/** A aba "Documentos" foi descontinuada: apaga a planilha junto com o setup. */
+function removerAbaDocumentos_(ss) {
+  const sh = getAba_(ss, 'Documentos');
+  if (sh) ss.deleteSheet(sh);
+}
+
+function ensureFirstUser_() {
+  if (readAll_('usuarios').length) return;
+  const email = String(Session.getEffectiveUser().getEmail() || '').toLowerCase();
+  if (!email) return;
+  writeRow_('usuarios', {
+    id: nextId_('usuarios'), nome: email.split('@')[0], perfil: 'Admin', ativo: 'Sim',
+    criadoEm: new Date(), criadoPor: 'sistema', atualizadoEm: new Date(), atualizadoPor: 'sistema'
+  }, null);
+}
+
+/**
+ * Uma vez (na versão 2.x) os campos "Cliente" de Pedidos, Orçamentos e OS eram
+ * texto livre. Agora apontam para o cadastro de Clientes. Esta migração cria um
+ * cliente para cada texto digitado (sem duplicar) e vincula os registros ao ID
+ * correspondente. Idempotente: nomes que já viraram cadastro são reaproveitados.
+ */
+function migrarClientes_() {
+  const cli = readAll_('clientes');
+  const ids = [], porNome = {};
+  cli.forEach(function (c) {
+    ids.push(c.id);
+    const n = String(c.nome || '').trim().toLowerCase();
+    if (n && porNome[n] === undefined) porNome[n] = c.id;
+  });
+  const ehId = function (id) { return ids.indexOf(id) >= 0; };
+  const garantir = function (valor) {
+    const s = String(valor === undefined || valor === null ? '' : valor).trim();
+    if (!s) return '';
+    if (ehId(s)) return s; // já aponta para um cadastro válido
+    const lower = s.toLowerCase();
+    if (porNome[lower]) return porNome[lower];
+    const agora = new Date();
+    const id = nextId_('clientes');
+    writeRow_('clientes', {
+      id: id, nome: s, ativo: 'Sim', criadoEm: agora, criadoPor: 'sistema', atualizadoEm: agora, atualizadoPor: 'sistema'
+    }, null);
+    ids.push(id); porNome[lower] = id;
+    return id;
+  };
+  ['pedidos', 'orcamentos', 'os'].forEach(function (e) {
+    readAll_(e).forEach(function (r) {
+      const ref = garantir(r.cliente);
+      if (!ref || ref === r.cliente) return;
+      const f = findById_(e, r.id);
+      if (f) writeRow_(e, { id: r.id, cliente: ref }, f.row);
+    });
+  });
+}
+
+/* ============================================================================
+ *  WEB APP
+ * ========================================================================== */
+function doGet(e) {
+  const p = (e && e.parameter) || {};
+  const out = HtmlService.createTemplateFromFile('index');
+  out.embutido = String(p.embed || '') === '1'; // usado pela página incorporada
+  return out.evaluate()
+    .setTitle(APP.nome)
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL); // permite o <iframe>
+}
+
+/**
+ * Gera o HTML da página que incorpora o app num site seu (ou no Google Sites),
+ * sem a faixa do Apps Script. Execute a função e copie o resultado do registro
+ * de execução (Ctrl+Enter para ver os logs). O arquivo também é salvo no Drive,
+ * na pasta de documentos do sistema, como "incorporar.html".
+ */
+function paginaIncorporacao() {
+  const url = ScriptApp.getService().getUrl().replace(/\/dev$/, '/exec');
+  const cfg = getConfig_();
+  const titulo = cfg.empresa_nome ? cfg.empresa_nome + ' — ' + APP.nome : APP.nome;
+  const html = [
+    '<!DOCTYPE html>',
+    '<html lang="pt-BR">',
+    '<head>',
+    '<meta charset="utf-8">',
+    '<meta name="viewport" content="width=device-width, initial-scale=1">',
+    '<title>' + esc_(titulo) + '</title>',
+    '<style>html,body{margin:0;height:100%;background:#EDF1F3}',
+    'iframe{border:0;display:block;width:100%;height:100%}</style>',
+    '</head>',
+    '<body>',
+    '<iframe src="' + esc_(url) + '?embed=1" title="' + esc_(titulo) + '"',
+    ' allow="clipboard-write; fullscreen"></iframe>',
+    '</body>',
+    '</html>'
+  ].join('\n');
+
+  const pasta = pastaDocs_();
+  const antigos = pasta.getFilesByName('incorporar.html');
+  while (antigos.hasNext()) antigos.next().setTrashed(true);
+  const arquivo = pasta.createFile('incorporar.html', html, MimeType.HTML);
+
+  Logger.log('URL do app: ' + url);
+  Logger.log('Arquivo salvo no Drive: ' + arquivo.getUrl());
+  Logger.log('--- copie o HTML abaixo ---\n' + html);
+  return html;
+}
+
+function guard_(fn) {
+  try { return { ok: true, data: fn() }; }
+  catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+}
+
+/* ============================================================================
+ *  USUÁRIOS E PERMISSÕES  — 2 níveis: Admin (mestre ou perfil Admin) e Padrão.
+ *  O usuário/senha mestre vêm das configurações (admin_usuario / admin_senha)
+ *  e liberam o acesso a "Usuários" e "Configurações" sem depender de cadastro.
+ * ========================================================================== */
+/**
+ * Login validado fica em cache por 10 min (chave = hash de usuário+senha), então
+ * as chamadas seguintes não releem a aba Usuários. Qualquer gravação em Usuários
+ * ou nas Configurações troca a "geração" e invalida todos os logins em cache.
+ */
+let USER_MEMO_ = null;
+function currentUser_(creds) {
+  if (USER_MEMO_) return Object.assign({}, USER_MEMO_);
+  const chave = chaveAuth_(creds);
+  if (chave) {
+    try { const c = CacheService.getScriptCache().get(chave); if (c) { USER_MEMO_ = JSON.parse(c); return Object.assign({}, USER_MEMO_); } } catch (e) {}
+  }
+  const u = currentUserSemCache_(creds);
+  USER_MEMO_ = u;
+  if (chave) { try { CacheService.getScriptCache().put(chave, JSON.stringify(u), 600); } catch (e) {} }
+  return Object.assign({}, u);
+}
+
+function currentUserSemCache_(creds) {
+  const mestre = adminOk_(creds);
+  if (mestre) return { id: 'MESTRE', nome: String(creds.usuario || 'Administrador'), email: '', perfil: 'Admin' };
+  const c = creds || {};
+  const usuario = String(c.usuario == null ? '' : c.usuario).trim();
+  const senha = String(c.senha == null ? '' : c.senha);
+  if (!usuario) throw new Error('Informe usuário e senha para acessar o sistema.');
+  return userPorLogin_(usuario, senha);
+}
+
+function chaveAuth_(creds) {
+  if (!creds || !creds.usuario) return '';
+  const gen = PropertiesService.getScriptProperties().getProperty('AUTH_GEN') || '0';
+  const texto = gen + '|' + String(creds.usuario).trim().toLowerCase() + '|' + String(creds.senha == null ? '' : creds.senha);
+  return 'AUTH_' + Utilities.base64EncodeWebSafe(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, texto, Utilities.Charset.UTF_8));
+}
+
+function invalidarAuth_() {
+  USER_MEMO_ = null;
+  PropertiesService.getScriptProperties().setProperty('AUTH_GEN', String(Date.now()));
+}
+
+/** Login por usuário (nome) + senha definida no cadastro de Usuários. */
+function userPorLogin_(usuario, senha) {
+  const busca = usuario.toLowerCase();
+  const u = readAll_('usuarios').filter(function (x) {
+    return String(x.nome).trim().toLowerCase() === busca;
+  })[0];
+  if (!u) throw new Error('Usuário não encontrado. Peça a um administrador para cadastrá-lo em Usuários.');
+  if (u.ativo === 'Não') throw new Error('Seu usuário está inativo. Fale com um administrador.');
+  if (!u.senhaHash && !String(u.senha || '')) throw new Error('Este usuário ainda não possui senha. Peça ao administrador para definir a senha de acesso em Usuários.');
+  const valida = u.senhaHash ? senhaConfere_(senha, u.senhaHash) : String(u.senha) === senha;
+  if (!valida) throw new Error('Usuário ou senha incorretos.');
+  if (!u.senhaHash) {
+    withLock_(function () {
+      const atual = findById_('usuarios', u.id);
+      if (atual && !atual.data.senhaHash && String(atual.data.senha || '') === senha) {
+        writeRow_('usuarios', { id: u.id, senha: '', senhaHash: hashSenha_(senha) }, atual.row);
+      }
+    });
+  }
+  return { id: u.id, nome: u.nome, email: '', perfil: u.perfil };
+}
+
+/** true se creds coincidem com o usuário/senha mestre das configurações. */
+function adminOk_(creds) {
+  if (!creds || !creds.usuario || !creds.senha) return false;
+  const cfg = getConfig_();
+  const u = String(creds.usuario).trim().toUpperCase();
+  const s = String(creds.senha);
+  return u === String(cfg.admin_usuario || '').trim().toUpperCase() && s === String(cfg.admin_senha || '');
+}
+
+/** O usuário só opera a área administrativa se for Admin OR se logou como mestre. */
+function acessoAdmin_(user, creds) {
+  if (user.perfil === 'Admin') return true;
+  return adminOk_(creds);
+}
+
+function can_(user, entity, act, creds) {
+  const def = SCHEMA[entity];
+  const alvo = (def && def.permAs) || entity;
+  if (['usuarios', 'config'].indexOf(alvo) >= 0) return acessoAdmin_(user, creds);
+  const p = PERMISSOES[user.perfil] || {};
+  const s = p[alvo] !== undefined ? p[alvo] : (p['*'] || '');
+  return s.indexOf(act) >= 0;
+}
+
+function need_(user, entity, act, creds) {
+  if (!can_(user, entity, act, creds)) throw new Error('Seu perfil (' + user.perfil + ') não tem permissão para esta ação.');
+}
+
+function needAdmin_(user, creds) {
+  if (!acessoAdmin_(user, creds)) throw new Error('Acesso restrito a administradores. Use o login mestre (cadastro de usuários).');
+}
+
+function permsFor_(user, creds) {
+  const out = {};
+  Object.keys(SCHEMA).concat(['indicadores']).forEach(function (e) {
+    out[e] = ['c', 'r', 'u', 'd'].filter(function (a) { return can_(user, e, a, creds); }).join('');
+  });
+  out.config = acessoAdmin_(user, creds) ? 'ru' : '';
+  return out;
+}
+
+function clientSchema_() {
+  const out = {};
+  Object.keys(SCHEMA).forEach(function (e) {
+    const d = SCHEMA[e];
+    out[e] = {
+      titulo: d.titulo, singular: d.singular, readonly: !!d.readonly, permAs: d.permAs || null,
+      labelKeys: d.labelKeys || [], defaults: d.defaults || {},
+      cols: d.cols.map(function (c) {
+        return { k: c.k, l: c.l, t: c.t, opts: c.opts || null, ref: c.ref || null, req: !!c.req, ro: !!c.ro, hidden: !!c.hidden, list: !!c.list };
+      })
+    };
+  });
+  return out;
+}
+
+/* ============================================================================
+ *  API — chamada pela interface (google.script.run)
+ * ========================================================================== */
+function api_bootstrap(creds) {
+  return guard_(function () {
+    ensureSetup_();
+    const user = currentUser_(creds);
+    if (user.id !== 'MESTRE') {
+      const registro = findById_('usuarios', user.id);
+      user.foto = registro ? fotoPerfilUri_(registro.data.fotoId) : '';
+    }
+    return { app: APP.nome, user: user, perms: permsFor_(user, creds), schema: clientSchema_(), config: configPublic_(), temLogo: temLogo_(), logo: logoDataUri_(), usuarioMaster: adminOk_(creds), hoje: hoje_() };
+  });
+}
+
+/** Confere as credenciais mestre e devolve ok (usado na tela de login). */
+function api_verificarAdmin(creds) {
+  return guard_(function () {
+    const ok = adminOk_(creds);
+    return { ok: ok, usuarioMaster: ok, nome: ok ? String(creds.usuario) : null };
+  });
+}
+
+/** Info pública para a tela de login (nome do app, do config e logotipo). */
+function api_publicInfo() {
+  return guard_(function () {
+    garantirPastasImagens_();
+    const cfg = getConfig_();
+    return { app: APP.nome, empresa: cfg.empresa_nome || '', logo: logoDataUri_(), temLogo: temLogo_() };
+  });
+}
+
+/**
+ * Confere usuário (nome) + senha definida no cadastro de Usuários.
+ * O mestre entra com as credenciais de administração (admin_usuario/admin_senha).
+ */
+function api_usuarioLogin(usuario, senha) {
+  return guard_(function () {
+    ensureSetup_();
+    const u = String(usuario || '').trim();
+    if (!u) throw new Error('Informe o usuário.');
+    return userPorLogin_(u, String(senha == null ? '' : senha));
+  });
+}
+
+function api_list(entity, creds) {
+  return guard_(function () {
+    const user = currentUser_(creds);
+    if (!SCHEMA[entity]) throw new Error('Entidade inválida.');
+    need_(user, entity, 'r', creds);
+    const rows = readAll_(entity);
+    return entity === 'usuarios' ? rows.map(usuarioPublico_) : rows;
+  });
+}
+
+/** Várias listas numa única ida ao servidor (as que o perfil não pode ler são ignoradas). */
+function api_carregar(entities, creds) {
+  return guard_(function () {
+    const user = currentUser_(creds);
+    const out = {};
+    (entities || []).forEach(function (e) {
+      if (!SCHEMA[e] || !can_(user, e, 'r', creds)) return;
+      const rows = readAll_(e);
+      out[e] = e === 'usuarios' ? rows.map(usuarioPublico_) : rows;
+    });
+    return out;
+  });
+}
+
+function usuarioPublico_(u) {
+  return Object.assign({}, u, { senha: '', senhaHash: '', fotoId: '' });
+}
+
+/** Cria (sem id) ou edita (com id). Aceita registros parciais na edição. */
+function api_save(entity, rec, creds) {
+  return guard_(function () {
+    ensureSetup_();
+    const user = currentUser_(creds);
+    const def = SCHEMA[entity];
+    if (!def) throw new Error('Entidade inválida.');
+    if (def.readonly) throw new Error('Esta aba é gerada pelo sistema e não pode ser editada.');
+    rec = rec || {};
+    need_(user, entity, rec.id ? 'u' : 'c', creds);
+    const novoUsuario = entity === 'usuarios' && !rec.id;
+    const senhaDigitada = novoUsuario ? String(rec.senha || '') : '';
+    let dados = null;
+    const out = withLock_(function () {
+      dados = persist_(entity, rec, user);
+      const salvo = ser_(def, dados);
+      return { registro: entity === 'usuarios' ? usuarioPublico_(salvo) : salvo, mudancas: mudancas_() };
+    });
+    if (novoUsuario) out.aviso = enviarBoasVindas_(dados, senhaDigitada);
+    return out;
+  });
+}
+
+function api_delete(entity, id, creds) {
+  return guard_(function () {
+    const user = currentUser_(creds);
+    const def = SCHEMA[entity];
+    if (!def) throw new Error('Entidade inválida.');
+    if (def.readonly) throw new Error('Esta aba é gerada pelo sistema e não pode ser editada.');
+    need_(user, entity, 'd', creds);
+    return withLock_(function () {
+      const f = findById_(entity, id);
+      if (!f) throw new Error('Registro não encontrado.');
+      const h = HOOKS[entity] || {};
+      if (h.beforeDelete) h.beforeDelete(f.data, user);
+      if (entity === 'usuarios' && f.data.fotoId) {
+        try { DriveApp.getFileById(f.data.fotoId).setTrashed(true); } catch (e) { /* foto já removida */ }
+      }
+      sheet_(entity).deleteRow(f.row);
+      invalidar_(entity);
+      if (entity === 'usuarios') invalidarAuth_();
+      marcarRemovido_(entity, id);
+      return { mudancas: mudancas_() };
+    });
+  });
+}
+
+/**
+ * Fluxo: Pedido → Orçamento → Ordem de Serviço → Entrada de Caixa.
+ * Cada passo cria o próximo registro já vinculado e atualiza o status do anterior.
+ * Tudo continua editável depois.
+ */
+function api_converter(from, id, creds) {
+  return guard_(function () {
+    const user = currentUser_(creds);
+    return withLock_(function () {
+      const src = findById_(from, id);
+      if (!src) throw new Error('Registro não encontrado.');
+      const s = src.data, cfg = getConfig_(), hoje = hoje_();
+      let destino, novo;
+
+      if (from === 'pedidos') {
+        need_(user, 'orcamentos', 'c'); need_(user, 'pedidos', 'u');
+        if (s.status === 'Cancelado') throw new Error('Este pedido está cancelado. Altere o status antes de gerar um orçamento.');
+        const jaOrc = readAll_('orcamentos').filter(function (o) { return o.pedidoId === s.id && ['Recusado', 'Expirado'].indexOf(o.status) < 0; })[0];
+        if (jaOrc) throw new Error('Este pedido já gerou o ' + jaOrc.id + ' (' + jaOrc.status + '). Edite-o em Orçamentos.');
+        destino = 'orcamentos';
+        novo = persist_('orcamentos', {
+          pedidoId: s.id, cliente: s.cliente, titulo: String(s.descricao || '').slice(0, 120), itens: '[]', desconto: 0,
+          validade: addDays_(hoje, num_(cfg.validade_orcamento_dias) || 15), status: 'Rascunho'
+        }, user);
+        persist_('pedidos', { id: s.id, status: 'Orçado' }, user);
+
+      } else if (from === 'orcamentos') {
+        need_(user, 'os', 'c'); need_(user, 'orcamentos', 'u');
+        if (['Recusado', 'Expirado'].indexOf(s.status) >= 0) throw new Error('Orçamento ' + s.status.toLowerCase() + ' não pode gerar OS.');
+        if (s.validade && String(s.validade) < hoje) throw new Error('Este orçamento venceu em ' + String(s.validade).split('-').reverse().join('/') + '. Atualize a validade antes de gerar a OS.');
+        const ja =readAll_('os').filter(function (o) { return o.orcamentoId === s.id && o.status !== 'Cancelada'; })[0];
+        if (ja) throw new Error('Este orçamento já gerou a ' + ja.id + '. Edite-a em Ordens de serviço.');
+        destino = 'os';
+        novo = persist_('os', {
+          orcamentoId: s.id, pedidoId: s.pedidoId, cliente: s.cliente, descricao: s.titulo, itens: s.itens,
+          desconto: s.desconto, dataAbertura: hoje, status: 'Aberta'
+        }, user);
+        persist_('orcamentos', { id: s.id, status: 'Aprovado' }, user);
+
+      } else if (from === 'os') {
+        need_(user, 'financeiro', 'c'); need_(user, 'os', 'u');
+        if (s.status === 'Cancelada') throw new Error('Esta OS está cancelada e não pode ser faturada.');
+        if (num_(s.total) <= 0) throw new Error('A OS não tem valor. Adicione itens antes de lançar a entrada.');
+        const jaFin = readAll_('financeiro').filter(function (f) { return f.osId === s.id && f.tipo === 'Entrada' && f.status !== 'Cancelado'; })[0];
+        if (jaFin) throw new Error('Esta OS já tem a entrada ' + jaFin.id + ' no Financeiro. Edite-a por lá.');
+        destino = 'financeiro';
+        const refCli = findById_('clientes', s.cliente);
+        const nomeCli = refCli ? (refCli.data.nome || s.cliente) : String(s.cliente || '');
+        novo = persist_('financeiro', {
+          tipo: 'Entrada', categoria: 'Serviços', descricao: s.id + ' — ' + nomeCli, parte: nomeCli, osId: s.id,
+          valor: s.total, vencimento: addDays_(hoje, num_(cfg.prazo_recebimento_dias) || 0), status: 'Pendente'
+        }, user);
+        persist_('os', { id: s.id, status: 'Faturada' }, user);
+
+      } else {
+        throw new Error('Este registro não avança no fluxo.');
+      }
+      return { destino: destino, registro: ser_(SCHEMA[destino], novo), mudancas: mudancas_() };
+    });
+  });
+}
+
+/** Entrada, saída ou inventário (define o saldo) de um material. */
+function api_movEstoque(materialId, tipo, qtd, obs, creds) {
+  return guard_(function () {
+    const user = currentUser_(creds);
+    need_(user, 'materiais', 'u', creds);
+    const q = num_(qtd);
+    if (tipo !== 'Inventário' && q <= 0) throw new Error('Informe uma quantidade maior que zero.');
+    if (tipo === 'Inventário' && q < 0) throw new Error('A contagem não pode ser negativa.');
+    return withLock_(function () {
+      const m = findById_('materiais', materialId);
+      if (!m) throw new Error('Material não encontrado.');
+      const atual = num_(m.data.estoqueAtual);
+      let delta, rotulo;
+      if (tipo === 'Entrada') { delta = q; rotulo = 'Entrada'; }
+      else if (tipo === 'Saída') {
+        if (q > atual) throw new Error('Saída de ' + q + ' ' + (m.data.unidade || 'un') + ' é maior que o estoque atual (' + atual + ' ' + (m.data.unidade || 'un') + ').');
+        delta = -q; rotulo = 'Saída';
+      }
+      else { delta = q - atual; rotulo = 'Ajuste'; }
+      ajustarEstoque_(materialId, delta, rotulo, obs ? 'Manual: ' + obs : 'Manual', user);
+      return { mudancas: mudancas_() };
+    });
+  });
+}
+
+/** Config sem os campos sensíveis (a senha mestre nunca vai para o navegador). */
+function configPublic_() {
+  const cfg = getConfig_();
+  const out = {};
+  Object.keys(cfg).forEach(function (k) { if (k !== 'admin_senha') out[k] = cfg[k]; });
+  return out;
+}
+
+function api_getConfig(creds) {
+  return guard_(function () { currentUser_(creds); return { config: configPublic_(), logo: logoInfo_() }; });
+}
+
+function api_saveConfig(obj, creds) {
+  return guard_(function () {
+    const user = currentUser_(creds);
+    needAdmin_(user, creds);
+    return withLock_(function () {
+const sh = getAba_(getSS_(), 'Config');
+      const last = sh.getLastRow();
+      const chaves = sh.getRange(2, 1, last - 1, 1).getValues().map(function (r) { return r[0]; });
+      CONFIG_PADRAO.forEach(function (p) {
+        if (Object.prototype.hasOwnProperty.call(obj, p[0])) {
+          const i = chaves.indexOf(p[0]);
+          if (i >= 0) sh.getRange(i + 2, 2).setValue(String(obj[p[0]]));
+        }
+      });
+      limparCacheConfig_();
+      invalidarAuth_(); // usuário/senha mestre podem ter mudado
+      return configPublic_();
+    });
+  });
+}
+
+/* ============================================================================
+ *  DASHBOARD
+ * ========================================================================== */
+/**
+ * Indicadores com filtros. f = { de, ate, cliente, parceiro } (datas yyyy-MM-dd).
+ * Sem período informado usa o mês vigente.
+ *  - Pedidos/orçamentos: pela data de criação; OS: pela abertura (concluídas: pela conclusão);
+ *  - Financeiro: recebido/pago pela data de pagamento, a receber/a pagar pelo vencimento;
+ *  - "Vencido", "OS atrasadas" e estoque são a posição de HOJE (só cliente/parceiro filtram).
+ */
+function api_dashboard(creds, f) {
+  return guard_(function () {
+    const user = currentUser_(creds);
+    need_(user, 'indicadores', 'r', creds);
+    f = f || {};
+    const hoje = hoje_();
+    const dataOk = function (x) { return /^\d{4}-\d{2}-\d{2}$/.test(String(x || '')); };
+    const de = dataOk(f.de) ? f.de : hoje.slice(0, 8) + '01';
+    const ate = dataOk(f.ate) ? f.ate : ultimoDiaMes_(hoje);
+    if (de > ate) throw new Error('A data inicial do filtro é maior que a final.');
+    const noPeriodo = function (d) { d = String(d || '').slice(0, 10); return !!d && d >= de && d <= ate; };
+    const cliente = String(f.cliente || ''), parceiro = String(f.parceiro || '');
+
+    const ped0 = readAll_('pedidos'), orc0 = readAll_('orcamentos'), os0 = readAll_('os'), mat = readAll_('materiais');
+    const cliNome = {};
+    readAll_('clientes').forEach(function (c) { cliNome[c.id] = c.nome; });
+    const soma = function (arr, k) { return arr.reduce(function (s, x) { return s + num_(x[k]); }, 0); };
+    const em = function (arr, lista) { return arr.filter(function (x) { return lista.indexOf(x.status) >= 0; }); };
+
+    // filtros de cliente / parceiro (parceiro chega a pedidos e orçamentos pelas OS vinculadas)
+    const os = os0.filter(function (o) { return (!cliente || o.cliente === cliente) && (!parceiro || o.parceiro === parceiro); });
+    const osIds = {}, pedDoParc = {}, orcDoParc = {};
+    os.forEach(function (o) { osIds[o.id] = o; if (o.pedidoId) pedDoParc[o.pedidoId] = 1; if (o.orcamentoId) orcDoParc[o.orcamentoId] = 1; });
+    const ped = ped0.filter(function (p) { return (!cliente || p.cliente === cliente) && (!parceiro || pedDoParc[p.id]); });
+    const orc = orc0.filter(function (o) { return (!cliente || o.cliente === cliente) && (!parceiro || orcDoParc[o.id]); });
+
+    const pedP = ped.filter(function (x) { return noPeriodo(x.criadoEm); });
+    const orcP = orc.filter(function (x) { return noPeriodo(x.criadoEm); });
+    const osP = os.filter(function (x) { return noPeriodo(x.dataAbertura || x.criadoEm); });
+
+    const pedAbertos = em(pedP, ['Novo', 'Em análise']);
+    const orcAbertos = em(orcP, ['Rascunho', 'Enviado']);
+    const osAtivas = em(osP, ['Aberta', 'Em andamento']);
+    const osConcl = em(os, ['Concluída', 'Faturada']).filter(function (o) { return noPeriodo(o.dataConclusao); });
+    const osAtrasadas = em(os, ['Aberta', 'Em andamento']).filter(function (o) { return o.previsao && o.previsao < hoje; });
+    const enviados = orcP.filter(function (o) { return o.status !== 'Rascunho'; });
+    const aprovados = orcP.filter(function (o) { return o.status === 'Aprovado'; });
+    const receitaOS = soma(osConcl, 'total');
+    const estoqueBaixo = mat.filter(function (m) {
+      const est = num_(m.estoqueAtual), min = num_(m.estoqueMin);
+      return m.ativo !== 'Não' && est <= min && (min > 0 || est < 0);
+    });
+
+    const out = {
+      hoje: hoje,
+      filtro: { de: de, ate: ate, cliente: cliente, parceiro: parceiro },
+      pipeline: {
+        pedidos: { qtd: pedAbertos.length },
+        orcamentos: { qtd: orcAbertos.length, valor: soma(orcAbertos, 'total') },
+        os: { qtd: osAtivas.length, valor: soma(osAtivas, 'total') }
+      },
+      op: {
+        conversao: enviados.length ? aprovados.length / enviados.length : null,
+        ticketMedio: osConcl.length ? receitaOS / osConcl.length : null,
+        margem: receitaOS > 0 ? (receitaOS - soma(osConcl, 'custoMateriais')) / receitaOS : null,
+        osAtrasadas: osAtrasadas.length,
+        osConcluidas: osConcl.length,
+        valorEstoque: mat.reduce(function (s, m) { return s + num_(m.estoqueAtual) * num_(m.custo); }, 0)
+      },
+      estoqueBaixo: estoqueBaixo.slice(0, 8).map(function (m) { return { id: m.id, nome: m.nome, estoque: num_(m.estoqueAtual), min: num_(m.estoqueMin), un: m.unidade }; }),
+      osAtrasadas: osAtrasadas.slice(0, 6).map(function (o) { return { id: o.id, cliente: cliNome[o.cliente] || o.cliente, previsao: o.previsao }; }),
+      fin: null
+    };
+
+    if (can_(user, 'financeiro', 'r')) {
+      // com cliente/parceiro: só lançamentos ligados às OS filtradas (ou com o nome do cliente em "Cliente / Fornecedor")
+      const nomeCli = cliente ? String(cliNome[cliente] || '').trim().toLowerCase() : '';
+      const fin = readAll_('financeiro').filter(function (x) {
+        if (x.status === 'Cancelado') return false;
+        if (!cliente && !parceiro) return true;
+        if (x.osId) return !!osIds[x.osId];
+        return !parceiro && !!nomeCli && String(x.parte || '').trim().toLowerCase() === nomeCli;
+      });
+      const pagosEntre = function (tipo, a, b) {
+        return fin.filter(function (x) { const d = String(x.dataPagamento || ''); return x.tipo === tipo && x.status === 'Pago' && d >= a && d <= b; });
+      };
+      const pend = function (tipo) { return fin.filter(function (x) { return x.tipo === tipo && x.status === 'Pendente'; }); };
+
+      // gráfico: todos os meses do período (mínimo 6, terminando no mês final; máximo 24)
+      const serie = [];
+      const pf = ate.split('-'), pi = de.split('-');
+      const nMeses = Math.min(24, Math.max(6, (+pf[0] - +pi[0]) * 12 + (+pf[1] - +pi[1]) + 1));
+      for (let i = nMeses - 1; i >= 0; i--) {
+        const m = Utilities.formatDate(new Date(+pf[0], +pf[1] - 1 - i, 1), tz_(), 'yyyy-MM');
+        serie.push({ mes: m, entradas: soma(pagosEntre('Entrada', m + '-01', m + '-31'), 'valor'), saidas: soma(pagosEntre('Saída', m + '-01', m + '-31'), 'valor') });
+      }
+      const aReceber = pend('Entrada').filter(function (x) { return noPeriodo(x.vencimento); });
+      out.fin = {
+        recebidoMes: soma(pagosEntre('Entrada', de, ate), 'valor'),
+        pagoMes: soma(pagosEntre('Saída', de, ate), 'valor'),
+        aReceber: soma(aReceber, 'valor'),
+        vencido: soma(pend('Entrada').filter(function (x) { return x.vencimento && x.vencimento < hoje; }), 'valor'),
+        aPagar: soma(pend('Saída').filter(function (x) { return noPeriodo(x.vencimento); }), 'valor'),
+        saldoCaixa: soma(pagosEntre('Entrada', '', ate), 'valor') - soma(pagosEntre('Saída', '', ate), 'valor'),
+        serie: serie,
+        proximos: fin.filter(function (x) { return x.status === 'Pendente' && x.vencimento; })
+          .sort(function (a, b) { return a.vencimento < b.vencimento ? -1 : 1; }).slice(0, 6)
+          .map(function (x) { return { id: x.id, tipo: x.tipo, descricao: x.descricao, valor: num_(x.valor), vencimento: x.vencimento }; })
+      };
+    }
+    return out;
+  });
+}
+
+function ultimoDiaMes_(iso) {
+  const p = String(iso).split('-');
+  return Utilities.formatDate(new Date(+p[0], +p[1], 0), tz_(), 'yyyy-MM-dd');
+}
+
+/* ============================================================================
+ *  DOCUMENTOS (PDF)
+ *  Modelo em tabelas + estilos inline: é o que o conversor HTML→PDF do Google
+ *  renderiza de forma previsível (flexbox e grid não são suportados lá).
+ * ========================================================================== */
+function api_previewDocumento(entity, id, creds) {
+  return guard_(function () {
+    const user = currentUser_(creds);
+    need_(user, entity, 'r', creds);
+    const f = findById_(entity, id);
+    if (!f) throw new Error('Registro não encontrado.');
+    const d = docBuild_(entity, f.data);
+    return { html: d.html, titulo: d.titulo, tipo: d.tipo };
+  });
+}
+
+function api_gerarDocumento(entity, id, creds) {
+  return guard_(function () {
+    const user = currentUser_(creds);
+    need_(user, entity, 'r', creds);
+    const f = findById_(entity, id);
+    if (!f) throw new Error('Registro não encontrado.');
+    const d = docBuild_(entity, f.data);
+    const nome = d.titulo.replace(/[\\/:*?"<>|]/g, '-') + ' — ' + Utilities.formatDate(new Date(), tz_(), 'yyyy-MM-dd HHmm');
+    const pdf = Utilities.newBlob(d.html, 'text/html', nome + '.html').getAs('application/pdf').setName(nome + '.pdf');
+    const arquivo = pastaDocs_().createFile(pdf);
+    return { url: arquivo.getUrl(), titulo: d.titulo };
+  });
+}
+
+function pastaDocs_() {
+  const props = PropertiesService.getScriptProperties();
+  const id = props.getProperty('DOCS_FOLDER_ID');
+  if (id) { try { return DriveApp.getFolderById(id); } catch (e) { /* recria */ } }
+  const pasta = DriveApp.createFolder(APP.nome + ' — Documentos');
+  props.setProperty('DOCS_FOLDER_ID', pasta.getId());
+  return pasta;
+}
+
+function pastaImagem_(chave, nome) {
+  const props = PropertiesService.getScriptProperties();
+  const id = props.getProperty(chave);
+  if (id) { try { return DriveApp.getFolderById(id); } catch (e) { /* recria */ } }
+  const pasta = DriveApp.createFolder(nome);
+  props.setProperty(chave, pasta.getId());
+  return pasta;
+}
+
+function pastaLogoSistema_() {
+  return pastaImagem_('LOGO_FOLDER_ID', APP.nome + ' — Logo do Sistema');
+}
+
+function pastaIdeiaFutura_() {
+  return pastaImagem_('IDEIA_IMAGENS_FOLDER_ID', APP.nome + ' — Ideia Futura');
+}
+
+function garantirPastasImagens_() {
+  pastaLogoSistema_();
+  pastaIdeiaFutura_();
+}
+
+function linkDiretoImagem_(id) {
+  if (!id) return '';
+  try {
+    DriveApp.getFileById(id).setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    return 'https://drive.google.com/uc?export=view&id=' + encodeURIComponent(id);
+  } catch (e) { return ''; }
+}
+
+/* ---------- logotipo ---------- */
+const LOGO_MAX_BYTES = 1500000; // ~1,5 MB: acima disso o PDF fica pesado demais
+
+/** payload: { nome, mime, base64 } — enviado pela tela de configurações. */
+function api_uploadLogo(payload, creds) {
+  return guard_(function () {
+    const user = currentUser_(creds);
+    needAdmin_(user, creds);
+    payload = payload || {};
+    const mime = String(payload.mime || '').toLowerCase();
+    if (['image/png', 'image/jpeg', 'image/gif'].indexOf(mime) < 0) throw new Error('Use uma imagem PNG, JPG ou GIF.');
+    const bytes = decodificarBase64_(payload.base64);
+    if (!bytes.length) throw new Error('Arquivo vazio.');
+    if (bytes.length > LOGO_MAX_BYTES) throw new Error('Imagem muito grande. Envie um arquivo de até 1,5 MB.');
+    if (!temMarcaImagem_(bytes, mime)) throw new Error('O conteúdo do arquivo não corresponde ao formato informado.');
+    return gravarLogo_(bytes, mime);
+  });
+}
+
+/**
+ * Decodifica base64 de forma tolerante: remove prefixo "data:...;base64," e
+ * quaisquer espaços/quebras de linha, converte variantes seguras de URL (- e _)
+ * e completa o alinhamento com "=". Evita o erro "Não foi possível decodificar
+ * a sequência" que ocorre quando o payload vem sujo do navegador.
+ */
+function decodificarBase64_(s) {
+  let b64 = String(s === undefined || s === null ? '' : s);
+  b64 = b64.indexOf(',') >= 0 ? b64.split(',').pop() : b64;
+  b64 = b64.replace(/-/g, '+').replace(/_/g, '/').replace(/[^A-Za-z0-9+/=]/g, '').replace(/=/g, '');
+  const semPadding = b64;
+  if (semPadding.length % 4 === 1) throw new Error('Imagem corrompida ou codificação inválida.');
+  b64 = semPadding + '='.repeat((4 - semPadding.length % 4) % 4);
+  try { return Utilities.base64Decode(b64); }
+  catch (e) { throw new Error('Não foi possível decodificar a imagem. Tente salvar como PNG ou JPG e enviar novamente.'); }
+}
+
+const LOGO_CHUNK_SIZE = 180000;
+const LOGO_UPLOAD_PREFIX = 'ger_logo_upload_';
+const LOGO_CHUNK_PREFIX = 'logo_part_';
+
+function gravarLogo_(bytes, mime) {
+  const arquivo = pastaLogoSistema_().createFile(Utilities.newBlob(bytes, mime, 'logotipo.' + logoExt2_(mime)));
+  const props = PropertiesService.getScriptProperties();
+  const anterior = props.getProperty('LOGO_ID');
+  props.setProperty('LOGO_ID', arquivo.getId());
+  props.setProperty('LOGO_MIME', mime);
+  limparCacheLogo_();
+  if (anterior) { try { DriveApp.getFileById(anterior).setTrashed(true); } catch (e) { /* arquivo anterior já removido */ } }
+  return logoInfo_();
+}
+
+function uploadLogoMeta_(uploadId) {
+  const id = String(uploadId || '');
+  if (!/^up_[A-Za-z0-9-]+$/.test(id)) throw new Error('Envio de logotipo inválido.');
+  const props = PropertiesService.getScriptProperties();
+  const raw = props.getProperty(LOGO_UPLOAD_PREFIX + id);
+  if (!raw) throw new Error('Envio de logotipo expirado ou inexistente.');
+  return { props: props, key: LOGO_UPLOAD_PREFIX + id, meta: JSON.parse(raw), id: id };
+}
+
+function api_logoIniciar(nome, mime, tamanhoBytes, totalPartes, creds) {
+  return guard_(function () {
+    const user = currentUser_(creds); needAdmin_(user, creds);
+    mime = String(mime || '').toLowerCase();
+    const tamanho = num_(tamanhoBytes), total = Number(totalPartes);
+    if (!['image/png', 'image/jpeg', 'image/gif'].includes(mime)) throw new Error('Use uma imagem PNG, JPG ou GIF.');
+    if (tamanho < 1 || tamanho > LOGO_MAX_BYTES) throw new Error('Imagem muito grande. Envie um arquivo de até 1,5 MB.');
+    if (!Number.isInteger(total) || total < 1 || total > Math.ceil(LOGO_MAX_BYTES * 4 / 3 / LOGO_CHUNK_SIZE)) throw new Error('Quantidade de partes inválida.');
+    const uploadId = 'up_' + Utilities.getUuid();
+    PropertiesService.getScriptProperties().setProperty(LOGO_UPLOAD_PREFIX + uploadId, JSON.stringify({ mime: mime, tamanho: tamanho, total: total, recebidas: 0 }));
+    return { uploadId: uploadId };
+  });
+}
+
+function api_logoEnviar(uploadId, indice, base64, creds) {
+  return guard_(function () {
+    const user = currentUser_(creds); needAdmin_(user, creds);
+    const info = uploadLogoMeta_(uploadId), idx = Number(indice);
+    if (!Number.isInteger(idx) || idx !== info.meta.recebidas || idx < 0 || idx >= info.meta.total) throw new Error('Ordem das partes inválida. Reinicie o envio do logotipo.');
+    const parte = String(base64 || '').replace(/\s/g, '').replace(/-/g, '+').replace(/_/g, '/');
+    if (!parte || parte.length > LOGO_CHUNK_SIZE) throw new Error('A parte do logotipo está vazia ou excedeu o limite.');
+    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(parte) || (idx < info.meta.total - 1 && parte.indexOf('=') >= 0)) throw new Error('A codificação da parte ' + (idx + 1) + ' do logotipo é inválida.');
+    const nome = LOGO_CHUNK_PREFIX + info.id + '_' + idx;
+    const existentes = pastaDocs_().getFilesByName(nome);
+    while (existentes.hasNext()) existentes.next().setTrashed(true);
+    pastaDocs_().createFile(nome, parte, MimeType.PLAIN_TEXT);
+    info.meta.recebidas++;
+    info.props.setProperty(info.key, JSON.stringify(info.meta));
+    return true;
+  });
+}
+
+function api_logoFinalizar(uploadId, creds) {
+  return guard_(function () {
+    const user = currentUser_(creds); needAdmin_(user, creds);
+    const info = uploadLogoMeta_(uploadId), pasta = pastaDocs_();
+    if (info.meta.recebidas !== info.meta.total) throw new Error('O envio do logotipo está incompleto.');
+    const partes = [];
+    for (let i = 0; i < info.meta.total; i++) {
+      const arquivos = pasta.getFilesByName(LOGO_CHUNK_PREFIX + info.id + '_' + i);
+      if (!arquivos.hasNext()) throw new Error('Falta uma parte do logotipo. Reinicie o envio.');
+      partes.push(arquivos.next().getBlob().getDataAsString());
+    }
+    const bytes = decodificarBase64_(partes.join(''));
+    if (bytes.length !== info.meta.tamanho || bytes.length > LOGO_MAX_BYTES) throw new Error('O tamanho recebido não corresponde ao arquivo enviado.');
+    if (!temMarcaImagem_(bytes, info.meta.mime)) throw new Error('O conteúdo do arquivo não corresponde ao formato informado.');
+    const result = gravarLogo_(bytes, info.meta.mime);
+    cancelarUploadLogo_(info);
+    return result;
+  });
+}
+
+function cancelarUploadLogo_(info) {
+  const pasta = pastaDocs_();
+  for (let i = 0; i < info.meta.total; i++) {
+    const arquivos = pasta.getFilesByName(LOGO_CHUNK_PREFIX + info.id + '_' + i);
+    while (arquivos.hasNext()) {
+      try { arquivos.next().setTrashed(true); } catch (e) { /* arquivo temporário já removido */ }
+    }
+  }
+  info.props.deleteProperty(info.key);
+}
+
+function api_logoCancelar(uploadId, creds) {
+  return guard_(function () {
+    const user = currentUser_(creds); needAdmin_(user, creds);
+    const info = uploadLogoMeta_(uploadId);
+    cancelarUploadLogo_(info);
+    return true;
+  });
+}
+
+function logoExt2_(mime) {
+  const m = String(mime || '').toLowerCase();
+  if (m.indexOf('png') >= 0) return 'png';
+  if (m.indexOf('gif') >= 0) return 'gif';
+  if (m.indexOf('jpeg') >= 0 || m.indexOf('jpg') >= 0) return 'jpg';
+  return 'png';
+}
+
+function api_removerLogo(creds) {
+  return guard_(function () {
+    const user = currentUser_(creds);
+    needAdmin_(user, creds);
+    apagarLogo_();
+    return logoInfo_();
+  });
+}
+
+function apagarLogo_() {
+  const props = PropertiesService.getScriptProperties();
+  const id = props.getProperty('LOGO_ID');
+  if (id) { try { DriveApp.getFileById(id).setTrashed(true); } catch (e) { /* já removido */ } }
+  props.deleteProperty('LOGO_ID'); props.deleteProperty('LOGO_MIME');
+}
+
+/** true se os bytes casam com os marcadores do mime informado (evita logo corrompida). */
+function temMarcaImagem_(bytes, mime) {
+  try {
+    const m = String(mime || '').toLowerCase();
+    const b = bytes || [];
+    if (b.length < 8) return false;
+    const byte = function (indice) { return b[indice] & 0xff; };
+    if (m.indexOf('png') >= 0) {
+      return byte(0) === 0x89 && byte(1) === 0x50 && byte(2) === 0x4e && byte(3) === 0x47;
+    }
+    if (m.indexOf('gif') >= 0) {
+      return byte(0) === 0x47 && byte(1) === 0x49 && byte(2) === 0x46 && byte(3) === 0x38;
+    }
+    if (m.indexOf('jpeg') >= 0 || m.indexOf('jpg') >= 0) {
+      return byte(0) === 0xff && byte(1) === 0xd8 && byte(b.length - 2) === 0xff && byte(b.length - 1) === 0xd9;
+    }
+    return true;
+  } catch (e) { return false; }
+}
+
+/** Data URI da logo — é assim que a imagem entra no PDF sem depender de link público. */
+function logoDataUri_() {
+  const props = PropertiesService.getScriptProperties();
+  const id = props.getProperty('LOGO_ID');
+  if (!id) return '';
+  const cache = CacheService.getScriptCache();
+  const hit = cache.get('LOGO_URI');
+  if (hit) return hit;
+  try {
+    const f = DriveApp.getFileById(id);
+    const blob = f.getBlob();
+    const mime = props.getProperty('LOGO_MIME') || blob.getContentType() || 'image/png';
+    const b = blob.getBytes();
+    if (!b.length || b.length > LOGO_MAX_BYTES || !temMarcaImagem_(b, mime)) {
+      try { f.setTrashed(true); } catch (e) {}
+      props.deleteProperty('LOGO_ID'); props.deleteProperty('LOGO_MIME');
+      return '';
+    }
+    const uri = 'data:' + mime + ';base64,' + Utilities.base64Encode(b);
+    if (uri.length < 100000) cache.put('LOGO_URI', uri, 21600); // limite do cache
+    return uri;
+  } catch (e) { return ''; }
+}
+
+/** Invalida o cache da logo (ao trocar ou remover a imagem). */
+function limparCacheLogo_() {
+  const cache = CacheService.getScriptCache();
+  const n = cache.get('LOGO_URI');
+  cache.remove('LOGO_URI');
+  cache.remove('LOGO_URI_N');
+  if (n) {
+    for (let i = 0, k = parseInt(n, 10) || 0; i < k; i++) cache.remove('LOGO_URI_' + i);
+  }
+}
+
+function temLogo_() { return !!PropertiesService.getScriptProperties().getProperty('LOGO_ID'); }
+
+function logoInfo_() {
+  const id = PropertiesService.getScriptProperties().getProperty('LOGO_ID');
+  return { temLogo: !!id, dataUri: logoDataUri_(), directUrl: linkDiretoImagem_(id) };
+}
+
+/* ============================================================================
+ *  PERFIL DO USUÁRIO — senha e foto são alteradas somente pelo próprio usuário.
+ * ========================================================================== */
+const PERFIL_FOTO_MAX_BYTES = 500000;
+
+function hashSenha_(senha) {
+  const sal = Utilities.getUuid().replace(/-/g, '');
+  const digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, sal + ':' + senha, Utilities.Charset.UTF_8);
+  return sal + ':' + Utilities.base64EncodeWebSafe(digest);
+}
+
+function senhaConfere_(senha, hash) {
+  const p = String(hash || '').split(':');
+  if (p.length !== 2 || !p[0] || !p[1]) return false;
+  const digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, p[0] + ':' + senha, Utilities.Charset.UTF_8);
+  return Utilities.base64EncodeWebSafe(digest) === p[1];
+}
+
+function pastaPerfis_() {
+  const props = PropertiesService.getScriptProperties();
+  const id = props.getProperty('PROFILE_FOLDER_ID');
+  if (id) { try { return DriveApp.getFolderById(id); } catch (e) { /* recria */ } }
+  const pasta = DriveApp.createFolder(APP.nome + ' — Fotos de perfil');
+  props.setProperty('PROFILE_FOLDER_ID', pasta.getId());
+  return pasta;
+}
+
+function fotoPerfilUri_(id) {
+  if (!id) return '';
+  try {
+    const f = DriveApp.getFileById(id);
+    const blob = f.getBlob();
+    const mime = String(blob.getContentType() || '').toLowerCase();
+    const bytes = blob.getBytes();
+    if (!['image/png', 'image/jpeg'].includes(mime) || bytes.length > PERFIL_FOTO_MAX_BYTES || !temMarcaImagem_(bytes, mime)) return '';
+    return 'data:' + mime + ';base64,' + Utilities.base64Encode(bytes);
+  } catch (e) { return ''; }
+}
+
+function api_atualizarPerfil(obj, creds) {
+  return guard_(function () {
+    const user = currentUser_(creds);
+    if (user.id === 'MESTRE') throw new Error('Entre com seu usuário cadastrado para editar o perfil.');
+    obj = obj || {};
+    const atual = String(obj.senhaAtual || '');
+    const nome = String(obj.nome || '').trim();
+    if (!atual) throw new Error('Informe sua senha atual para confirmar as alterações.');
+    if (!nome) throw new Error('Informe seu nome.');
+    const encontrado = findById_('usuarios', user.id);
+    if (!encontrado) throw new Error('Usuário não encontrado.');
+    const registro = encontrado.data;
+    const senhaValida = registro.senhaHash ? senhaConfere_(atual, registro.senhaHash) : String(registro.senha || '') === atual;
+    if (!senhaValida) throw new Error('A senha atual está incorreta.');
+    const duplicado = readAll_('usuarios').some(function (u) { return u.id !== user.id && String(u.nome).trim().toLowerCase() === nome.toLowerCase(); });
+    if (duplicado) throw new Error('Esse nome de usuário já está em uso.');
+    const nova = String(obj.novaSenha || '');
+    if (nova && nova.length < 8) throw new Error('A nova senha deve ter pelo menos 8 caracteres.');
+    if (nova && nova !== String(obj.confirmarSenha || '')) throw new Error('A confirmação da nova senha não confere.');
+    const dados = { id: user.id, nome: nome, atualizadoEm: new Date(), atualizadoPor: user.id };
+    if (nova) { dados.senha = ''; dados.senhaHash = hashSenha_(nova); }
+    else if (!registro.senhaHash && registro.senha) { dados.senha = ''; dados.senhaHash = hashSenha_(atual); }
+    writeRow_('usuarios', dados, encontrado.row);
+    return { nome: nome, senhaAlterada: !!nova };
+  });
+}
+
+function api_salvarFotoPerfil(payload, creds) {
+  return guard_(function () {
+    const user = currentUser_(creds);
+    if (user.id === 'MESTRE') throw new Error('Entre com seu usuário cadastrado para definir uma foto de perfil.');
+    payload = payload || {};
+    const mime = String(payload.mime || '').toLowerCase();
+    if (!['image/png', 'image/jpeg'].includes(mime)) throw new Error('Use uma foto PNG ou JPG.');
+    const bytes = decodificarBase64_(payload.base64);
+    if (!bytes.length || bytes.length > PERFIL_FOTO_MAX_BYTES) throw new Error('A foto deve ter no máximo 500 KB.');
+    if (!temMarcaImagem_(bytes, mime)) throw new Error('O conteúdo do arquivo não corresponde a uma imagem PNG ou JPG.');
+    const encontrado = findById_('usuarios', user.id);
+    if (!encontrado) throw new Error('Usuário não encontrado.');
+    const arquivo = pastaPerfis_().createFile(Utilities.newBlob(bytes, mime, user.id + (mime === 'image/png' ? '.png' : '.jpg')));
+    const anterior = String(encontrado.data.fotoId || '');
+    writeRow_('usuarios', { id: user.id, fotoId: arquivo.getId(), atualizadoEm: new Date(), atualizadoPor: user.id }, encontrado.row);
+    if (anterior) { try { DriveApp.getFileById(anterior).setTrashed(true); } catch (e) { /* foto anterior já removida */ } }
+    return { foto: fotoPerfilUri_(arquivo.getId()) };
+  });
+}
+
+function api_removerFotoPerfil(creds) {
+  return guard_(function () {
+    const user = currentUser_(creds);
+    if (user.id === 'MESTRE') throw new Error('Entre com seu usuário cadastrado para alterar a foto de perfil.');
+    const encontrado = findById_('usuarios', user.id);
+    if (!encontrado) throw new Error('Usuário não encontrado.');
+    const id = String(encontrado.data.fotoId || '');
+    writeRow_('usuarios', { id: user.id, fotoId: '', atualizadoEm: new Date(), atualizadoPor: user.id }, encontrado.row);
+    if (id) { try { DriveApp.getFileById(id).setTrashed(true); } catch (e) { /* foto anterior já removida */ } }
+    return true;
+  });
+}
+
+/** Nome amigável de um registro referenciado (ex.: o nome do cliente, dado o ID). */
+function refNome_(entity, id) {
+  if (!id) return '';
+  const def = SCHEMA[entity];
+  const label = (def.labelKeys && def.labelKeys[0]) || 'nome';
+  try {
+    const f = findById_(entity, id);
+    if (f && f.data[label]) return String(f.data[label]);
+    if (f) return f.data.id;
+  } catch (e) { /* segue */ }
+  return String(id);
+}
+
+/* ---------- montagem dos documentos ---------- */
+function docBuild_(entity, r) {
+  let tipo, titulo, meta, corpo, resumo = '';
+  if (entity === 'pedidos') {
+    tipo = 'Pedido'; titulo = 'Pedido ' + r.id;
+    meta = [['Cliente', refNome_('clientes', r.cliente)], ['Contato', r.contato], ['Prioridade', r.prioridade], ['Prazo desejado', fmtData_(r.prazo)], ['Status', r.status]];
+    corpo = bloco_('Descrição do pedido', r.descricao) + bloco_('Observações', r.obs);
+  } else if (entity === 'orcamentos') {
+    tipo = 'Orçamento'; titulo = 'Orçamento ' + r.id;
+    meta = [['Cliente', refNome_('clientes', r.cliente)], ['Pedido de origem', r.pedidoId], ['Validade da proposta', fmtData_(r.validade)], ['Status', r.status]];
+    resumo = destaque_('Valor total da proposta', fmtMoney_(r.total), r.validade ? 'Proposta válida até ' + fmtData_(r.validade) : '');
+    corpo = bloco_('Escopo', r.titulo) + tabelaItens_(r) + bloco_('Observações', r.obs) + assinaturas_('Pela empresa', 'De acordo — cliente');
+  } else if (entity === 'os') {
+    tipo = 'Ordem de Serviço'; titulo = 'Ordem de Serviço ' + r.id;
+    meta = [['Cliente', refNome_('clientes', r.cliente)], ['Parceiro executante', refNome_('parceiros', r.parceiro)], ['Orçamento aprovado', r.orcamentoId], ['Responsável', r.responsavel], ['Abertura', fmtData_(r.dataAbertura)], ['Previsão de entrega', fmtData_(r.previsao)], ['Status', r.status]];
+    resumo = destaque_('Valor da ordem', fmtMoney_(r.total), r.previsao ? 'Entrega prevista para ' + fmtData_(r.previsao) : '');
+    corpo = bloco_('Descrição do serviço', r.descricao) + tabelaItens_(r) + bloco_('Observações', r.obs) + assinaturas_('Responsável pela execução', 'Serviço recebido — cliente');
+  } else if (entity === 'financeiro') {
+    const recibo = r.tipo === 'Entrada' && r.status === 'Pago';
+    tipo = recibo ? 'Recibo' : 'Comprovante'; titulo = tipo + ' ' + r.id;
+    meta = [['Movimento', r.tipo], ['Categoria', r.categoria], [r.tipo === 'Entrada' ? 'Cliente' : 'Fornecedor', r.parte], ['Ordem de serviço', r.osId],
+      ['Vencimento', fmtData_(r.vencimento)], ['Data do pagamento', fmtData_(r.dataPagamento)], ['Forma de pagamento', r.forma], ['Status', r.status]];
+    resumo = destaque_(recibo ? 'Valor recebido' : 'Valor do lançamento', fmtMoney_(r.valor), recibo ? 'Quitado em ' + fmtData_(r.dataPagamento) : String(r.status || ''));
+    corpo = bloco_('Referente a', r.descricao) + bloco_('Observações', r.obs) +
+      (recibo ? '<p style="margin:18px 0 0;font-size:12.5px;color:#42525F">Recebemos de <b>' + esc_(r.parte || 'cliente') +
+        '</b> a importância de <b>' + fmtMoney_(r.valor) + '</b>, referente ao descrito acima, dando plena quitação.</p>' : '') +
+      assinaturas_(getConfig_().empresa_nome, r.tipo === 'Entrada' ? 'Cliente' : 'Fornecedor');
+  } else {
+    throw new Error('Este tipo de registro não possui modelo de documento.');
+  }
+  return { tipo: tipo, titulo: titulo, html: docShell_(getConfig_(), tipo, r.id, meta, resumo + corpo) };
+}
+
+const DOC = { tinta: '#0F1B2B', suave: '#5E7184', linha: '#E4E8EE', marca: '#EE7B12', fundo: '#F7F9FB' };
+
+function docShell_(cfg, tipo, numero, meta, corpo) {
+  const logo = logoDataUri_();
+  const contatos = [
+    cfg.empresa_documento ? 'CNPJ/CPF ' + cfg.empresa_documento : '',
+    cfg.empresa_endereco, cfg.empresa_telefone, cfg.empresa_email
+  ].filter(function (x) { return x; }).map(function (x) { return esc_(x); }).join('<br>');
+
+  const cab = '<table style="width:100%;border-collapse:collapse"><tr>' +
+    '<td style="vertical-align:top;padding:0">' +
+      (logo ? '<img src="' + logo + '" alt="" style="max-height:62px;max-width:230px">'
+            : '<div style="font-size:21px;font-weight:bold;color:' + DOC.marca + '">' + esc_(cfg.empresa_nome) + '</div>') +
+      (logo && cfg.empresa_nome ? '<div style="font-size:13px;font-weight:bold;color:' + DOC.tinta + ';margin-top:6px">' + esc_(cfg.empresa_nome) + '</div>' : '') +
+    '</td>' +
+    '<td style="vertical-align:top;text-align:right;padding:0;font-size:11px;color:' + DOC.suave + ';line-height:1.6">' + contatos + '</td>' +
+  '</tr></table>' +
+  '<div style="height:4px;background:' + DOC.marca + ';margin:14px 0 0"></div>' +
+  '<div style="height:1px;background:' + DOC.linha + ';margin:2px 0 22px"></div>';
+
+  const tit = '<table style="width:100%;border-collapse:collapse;margin-bottom:20px"><tr>' +
+    '<td style="padding:0;vertical-align:bottom">' +
+      '<div style="font-size:11px;letter-spacing:.14em;color:' + DOC.suave + '">DOCUMENTO INTERNO</div>' +
+      '<div style="font-size:27px;font-weight:bold;color:' + DOC.tinta + ';line-height:1.1;margin-top:3px">' + esc_(tipo) + '</div>' +
+    '</td>' +
+    '<td style="padding:0;text-align:right;vertical-align:bottom;font-size:12px;color:' + DOC.suave + '">' +
+      '<div style="font-size:16px;font-weight:bold;color:' + DOC.marca + '">' + esc_(numero) + '</div>' +
+      'Emitido em ' + Utilities.formatDate(new Date(), tz_(), 'dd/MM/yyyy') +
+    '</td></tr></table>';
+
+  const visiveis = meta.filter(function (m) { return m[1]; });
+  let cels = '';
+  for (let i = 0; i < visiveis.length; i += 2) {
+    cels += '<tr>' + [visiveis[i], visiveis[i + 1]].map(function (m) {
+      if (!m) return '<td style="width:50%;padding:9px 14px;border-top:1px solid ' + DOC.linha + '"></td>';
+      return '<td style="width:50%;padding:9px 14px;border-top:1px solid ' + DOC.linha + ';vertical-align:top">' +
+        '<div style="font-size:10.5px;color:' + DOC.suave + '">' + esc_(m[0]) + '</div>' +
+        '<div style="font-size:13px;font-weight:bold;color:' + DOC.tinta + '">' + esc_(m[1]) + '</div></td>';
+    }).join('') + '</tr>';
+  }
+  const dados = '<table style="width:100%;border-collapse:collapse;background:' + DOC.fundo + ';margin-bottom:6px">' + cels + '</table>';
+
+  return '<!DOCTYPE html><html><head><meta charset="utf-8"><title>' + esc_(tipo) + ' ' + esc_(numero) + '</title>' +
+    '<style>@page{size:A4;margin:18mm 15mm}' +
+    'body{font-family:Helvetica,Arial,sans-serif;color:' + DOC.tinta + ';font-size:12.5px;line-height:1.55;margin:0}' +
+    'h3{font-size:11px;letter-spacing:.1em;color:' + DOC.suave + ';margin:22px 0 5px;font-weight:bold}' +
+    'p{margin:0}</style></head><body>' +
+    cab + tit + dados + corpo +
+    '<div style="margin-top:30px;border-top:1px solid ' + DOC.linha + ';padding-top:8px;font-size:10.5px;color:#93A0AB">' +
+      esc_(cfg.rodape_documentos) + ' &nbsp;·&nbsp; ' + esc_(cfg.empresa_nome) +
+      ' &nbsp;·&nbsp; gerado em ' + Utilities.formatDate(new Date(), tz_(), 'dd/MM/yyyy HH:mm') +
+    '</div></body></html>';
+}
+
+function destaque_(rotulo, valor, nota) {
+  return '<table style="width:100%;border-collapse:collapse;margin:18px 0 4px"><tr>' +
+    '<td style="padding:14px 16px;background:' + DOC.marca + ';color:#fff">' +
+      '<div style="font-size:11px;color:#BBD9DE">' + esc_(rotulo) + '</div>' +
+      '<div style="font-size:24px;font-weight:bold;line-height:1.2">' + valor + '</div>' +
+      (nota ? '<div style="font-size:11px;color:#BBD9DE">' + esc_(nota) + '</div>' : '') +
+    '</td></tr></table>';
+}
+
+function bloco_(titulo, texto) {
+  if (!texto) return '';
+  return '<h3>' + esc_(titulo).toUpperCase() + '</h3><p>' + esc_(texto).replace(/\n/g, '<br>') + '</p>';
+}
+
+function assinaturas_(esq, dir) {
+  return '<table style="width:100%;border-collapse:collapse;margin-top:62px"><tr>' +
+    [esq, dir].map(function (t) {
+      return '<td style="width:44%;border-top:1px solid ' + DOC.tinta + ';padding:6px 0 0;text-align:center;font-size:11px;color:' + DOC.suave + '">' + esc_(t) + '</td>' +
+        '<td style="width:12%"></td>';
+    }).join('').replace(/<td style="width:12%"><\/td>$/, '') + '</tr></table>';
+}
+
+function tabelaItens_(r) {
+  const itens = parseItems_(r.itens);
+  if (!itens.length) return '<h3>ITENS</h3><p style="color:' + DOC.suave + '">Nenhum item lançado neste documento.</p>';
+  const linhas = itens.map(function (it, i) {
+    const fundo = i % 2 ? 'background:' + DOC.fundo + ';' : '';
+    const cel = 'padding:8px 12px;border-bottom:1px solid ' + DOC.linha + ';' + fundo;
+    return '<tr>' +
+      '<td style="' + cel + 'width:26px;color:' + DOC.suave + ';font-size:11px">' + (i + 1) + '</td>' +
+      '<td style="' + cel + '"><b>' + esc_(it.descricao || '—') + '</b><div style="font-size:10.5px;color:' + DOC.suave + '">' + esc_(it.tipo || '') + '</div></td>' +
+      '<td style="' + cel + 'text-align:right;width:60px">' + num_(it.qtd) + '</td>' +
+      '<td style="' + cel + 'text-align:right;width:96px">' + fmtMoney_(it.valorUnit) + '</td>' +
+      '<td style="' + cel + 'text-align:right;width:104px;font-weight:bold">' + fmtMoney_(num_(it.qtd) * num_(it.valorUnit)) + '</td></tr>';
+  }).join('');
+  const th = 'padding:8px 12px;background:' + DOC.marca + ';color:#fff;font-size:10.5px;letter-spacing:.06em;text-align:left';
+  const lin = function (rot, val, forte) {
+    return '<tr><td style="padding:' + (forte ? '10px 12px' : '5px 12px') + ';text-align:right;color:' + (forte ? DOC.tinta : DOC.suave) + ';' +
+      (forte ? 'border-top:2px solid ' + DOC.marca + ';font-size:15px;font-weight:bold' : '') + '">' + esc_(rot) + '</td>' +
+      '<td style="padding:' + (forte ? '10px 12px' : '5px 12px') + ';text-align:right;width:120px;' +
+      (forte ? 'border-top:2px solid ' + DOC.marca + ';font-size:17px;font-weight:bold;color:' + DOC.marca : 'font-weight:bold') + '">' + val + '</td></tr>';
+  };
+  return '<h3>ITENS</h3><table style="width:100%;border-collapse:collapse">' +
+    '<tr><th style="' + th + '"></th><th style="' + th + '">Descrição</th><th style="' + th + ';text-align:right">Qtd</th>' +
+    '<th style="' + th + ';text-align:right">Unitário</th><th style="' + th + ';text-align:right">Subtotal</th></tr>' + linhas + '</table>' +
+    '<table style="border-collapse:collapse;margin:10px 0 0 auto">' +
+      lin('Subtotal', fmtMoney_(r.subtotal)) +
+      (num_(r.desconto) ? lin('Desconto', '− ' + fmtMoney_(r.desconto)) : '') +
+      lin('Total', fmtMoney_(r.total), true) +
+    '</table>';
+}
+
+/* ============================================================================
+ *  MOTOR DE DADOS (leitura/escrita genérica no Sheets)
+ * ========================================================================== */
+/**
+ * Localiza uma aba ignorando caixa (maiúscula/minúscula) e espaços no nome.
+ * O `getSheetByName` falha quando a aba existe com escrita diferente,
+ * o que faz `insertSheet` disparar "Já existe uma página chamada ...".
+ */
+function getAba_(ss, nome) {
+  const alvo = String(nome);
+  const exata = ss.getSheetByName(alvo);
+  if (exata) return exata;
+  const chave = alvo.trim().toLowerCase();
+  const out = ss.getSheets().filter(function (s) { return String(s.getName()).trim().toLowerCase() === chave; })[0];
+  return out || null;
+}
+
+function sheet_(entity) {
+  const def = SCHEMA[entity];
+  if (!def) throw new Error('Entidade desconhecida: ' + entity);
+  const sh = getAba_(getSS_(), def.sheet);
+  if (!sh) throw new Error('Aba "' + def.sheet + '" não encontrada. Execute setupSistema().');
+  return sh;
+}
+
+/* ---------- memória por execução: evita reler a mesma aba várias vezes na mesma chamada ---------- */
+const MEMO_ = { linhas: {}, cab: {} };
+const MUDANCAS_ = { salvos: {}, removidos: {} };
+function invalidar_(entity) { delete MEMO_.linhas[entity]; }
+
+/** Registra o que a chamada gravou/apagou para a tela atualizar só isso (sem recarregar tudo). */
+function marcarSalvo_(entity, data) {
+  if (!data || !data.id) return;
+  (MUDANCAS_.salvos[entity] = MUDANCAS_.salvos[entity] || {})[data.id] = data;
+}
+function marcarRemovido_(entity, id) {
+  (MUDANCAS_.removidos[entity] = MUDANCAS_.removidos[entity] || []).push(id);
+  if (MUDANCAS_.salvos[entity]) delete MUDANCAS_.salvos[entity][id];
+}
+function mudancas_() {
+  const salvos = {};
+  Object.keys(MUDANCAS_.salvos).forEach(function (e) {
+    salvos[e] = Object.keys(MUDANCAS_.salvos[e]).map(function (id) {
+      const r = ser_(SCHEMA[e], MUDANCAS_.salvos[e][id]);
+      return e === 'usuarios' ? usuarioPublico_(r) : r;
+    });
+  });
+  return { salvos: salvos, removidos: MUDANCAS_.removidos };
+}
+
+function headerMap_(sh) {
+  const chave = sh.getSheetId();
+  if (MEMO_.cab[chave]) return MEMO_.cab[chave];
+  const n = sh.getLastColumn();
+  const hs = n ? sh.getRange(1, 1, 1, n).getValues()[0] : [];
+  const m = {};
+  hs.forEach(function (x, i) { const k = String(x).trim(); if (k && m[k] === undefined) m[k] = i; });
+  MEMO_.cab[chave] = m;
+  return m;
+}
+
+function rowToObj_(def, map, vals) {
+  const o = {};
+  def.cols.forEach(function (c) {
+    const i = map[c.l];
+    o[c.k] = i === undefined ? '' : fromCell_(c, vals[i]);
+  });
+  return o;
+}
+
+function readAll_(entity) {
+  if (!MEMO_.linhas[entity]) {
+    const def = SCHEMA[entity], sh = sheet_(entity);
+    const last = sh.getLastRow();
+    if (last < 2) MEMO_.linhas[entity] = [];
+    else {
+      const map = headerMap_(sh);
+      const idIdx = map['ID'];
+      const vals = sh.getRange(2, 1, last - 1, sh.getLastColumn()).getValues();
+      MEMO_.linhas[entity] = vals.filter(function (r) { return r[idIdx] !== ''; }).map(function (r) { return rowToObj_(def, map, r); });
+    }
+  }
+  // cópias rasas: quem alterar o objeto não contamina a memória da execução
+  return MEMO_.linhas[entity].map(function (o) { return Object.assign({}, o); });
+}
+
+function findById_(entity, id) {
+  const def = SCHEMA[entity], sh = sheet_(entity);
+  const last = sh.getLastRow();
+  if (last < 2) return null;
+  const map = headerMap_(sh);
+  const ids = sh.getRange(2, map['ID'] + 1, last - 1, 1).getValues();
+  for (let i = 0; i < ids.length; i++) {
+    if (String(ids[i][0]) === String(id)) {
+      const row = i + 2;
+      const vals = sh.getRange(row, 1, 1, sh.getLastColumn()).getValues()[0];
+      return { row: row, data: rowToObj_(def, map, vals) };
+    }
+  }
+  return null;
+}
+
+/** Grava um registro. Colunas desconhecidas (suas) e fórmulas existentes são preservadas. */
+function writeRow_(entity, data, row) {
+  const def = SCHEMA[entity];
+  let sh = sheet_(entity);
+  let map = headerMap_(sh);
+  const faltaColuna = def.cols.some(function (c) {
+    return map[c.l] === undefined && Object.prototype.hasOwnProperty.call(data, c.k);
+  });
+  if (faltaColuna) {
+    ensureSheet_(getSS_(), entity); // cria cabeçalhos novos (ex.: "Senha de acesso") antes de gravar
+    sh = sheet_(entity);
+    map = headerMap_(sh);
+  }
+  const width = sh.getLastColumn();
+  let arr;
+  if (row) {
+    const vals = sh.getRange(row, 1, 1, width).getValues()[0];
+    const fx = sh.getRange(row, 1, 1, width).getFormulas()[0];
+    arr = vals.map(function (v, i) { return fx[i] !== '' ? fx[i] : v; });
+  } else {
+    arr = new Array(width).fill('');
+    row = sh.getLastRow() + 1;
+    if (row > sh.getMaxRows()) sh.insertRowsAfter(sh.getMaxRows(), 500);
+  }
+  def.cols.forEach(function (c) {
+    if (Object.prototype.hasOwnProperty.call(data, c.k) && map[c.l] !== undefined) arr[map[c.l]] = toCell_(c, data[c.k]);
+  });
+  sh.getRange(row, 1, 1, width).setValues([arr]);
+  invalidar_(entity);
+  if (entity === 'usuarios') invalidarAuth_();
+  return row;
+}
+
+function persist_(entity, rec, user) {
+  const def = SCHEMA[entity];
+  const id = rec.id || null;
+  const prev = id ? findById_(entity, id) : null;
+  if (id && !prev) throw new Error('Registro não encontrado: ' + id);
+
+  const data = Object.assign({}, def.defaults || {}, prev ? prev.data : {}, pick_(def, rec));
+  Object.keys(data).forEach(function (k) { if (data[k] === '@hoje') data[k] = hoje_(); });
+
+  const agora = new Date();
+  if (!prev) { data.id = nextId_(entity); data.criadoEm = agora; data.criadoPor = user.id; }
+  data.atualizadoEm = agora; data.atualizadoPor = user.id;
+
+  const h = HOOKS[entity] || {};
+  if (h.before) h.before(data, prev ? prev.data : null, user);
+  def.cols.forEach(function (c) {
+    const senhaJaProtegida = entity === 'usuarios' && c.k === 'senha' && !!data.senhaHash;
+    if (c.req && !senhaJaProtegida && (data[c.k] === '' || data[c.k] === null || data[c.k] === undefined)) throw new Error('Preencha o campo: ' + c.l);
+  });
+  writeRow_(entity, data, prev ? prev.row : null);
+  marcarSalvo_(entity, data);
+  if (h.after) h.after(data, prev ? prev.data : null, user);
+  return data;
+}
+
+function pick_(def, rec) {
+  const o = {};
+  def.cols.forEach(function (c) {
+    if (c.t !== 'id' && !c.ro && Object.prototype.hasOwnProperty.call(rec, c.k)) o[c.k] = rec[c.k];
+  });
+  return o;
+}
+
+function ser_(def, data) {
+  const o = {};
+  def.cols.forEach(function (c) { o[c.k] = fromCell_(c, data[c.k] === undefined ? '' : data[c.k]); });
+  return o;
+}
+
+function nextId_(entity) {
+  const def = SCHEMA[entity], props = PropertiesService.getScriptProperties(), key = 'SEQ_' + entity;
+  let n = parseInt(props.getProperty(key) || '0', 10);
+  const sh = sheet_(entity), map = headerMap_(sh), last = sh.getLastRow();
+  if (last > 1) {
+    sh.getRange(2, map['ID'] + 1, last - 1, 1).getValues().forEach(function (r) {
+      const m = String(r[0]).match(/(\d+)$/);
+      if (m) n = Math.max(n, parseInt(m[1], 10));
+    });
+  }
+  n += 1;
+  props.setProperty(key, String(n));
+  return def.prefix + '-' + ('0000' + n).slice(-4);
+}
+
+/** Código numérico de 5 dígitos (ex.: 00001) usado pela aba Atividades. */
+function nextCodigo5_(entity) {
+  const props = PropertiesService.getScriptProperties(), key = 'COD5_' + entity;
+  let n = parseInt(props.getProperty(key) || '0', 10);
+  const sh = sheet_(entity), map = headerMap_(sh), last = sh.getLastRow();
+  const col = map['Código (5 dígitos)'];
+  if (last > 1 && col !== undefined) {
+    sh.getRange(2, col + 1, last - 1, 1).getValues().forEach(function (r) {
+      const m = String(r[0]).match(/(\d{5})$/);
+      if (m) n = Math.max(n, parseInt(m[1], 10));
+    });
+  }
+  n += 1;
+  props.setProperty(key, String(n));
+  return ('00000' + n).slice(-5);
+}
+
+function withLock_(fn) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try { return fn(); } finally { lock.releaseLock(); }
+}
+
+/* ---------- conversão de células ---------- */
+function toCell_(c, v) {
+  if (v === null || v === undefined || v === '') return '';
+  switch (c.t) {
+    case 'money':
+    case 'number': {
+      const n = typeof v === 'number' ? v : Number(String(v).replace(',', '.'));
+      return isNaN(n) ? '' : n;
+    }
+    case 'date': {
+      if (v instanceof Date) return v;
+      const m = String(v).match(/^(\d{4})-(\d{2})-(\d{2})/);
+      return m ? new Date(+m[1], +m[2] - 1, +m[3]) : String(v);
+    }
+    case 'datetime': {
+      if (v instanceof Date) return v;
+      const m = String(v).match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?/);
+      return m ? new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0)) : String(v);
+    }
+    default:
+      return (typeof v === 'object' && !(v instanceof Date)) ? JSON.stringify(v) : String(v);
+  }
+}
+
+function fromCell_(c, v) {
+  if (v instanceof Date) return Utilities.formatDate(v, tz_(), c.t === 'datetime' ? 'yyyy-MM-dd HH:mm:ss' : 'yyyy-MM-dd');
+  if (v === null || v === undefined) return '';
+  if (c.t === 'money' || c.t === 'number') return v === '' ? '' : (Number(v) || 0);
+  return v;
+}
+
+/* ============================================================================
+ *  ITENS, TOTAIS E ESTOQUE
+ * ========================================================================== */
+function parseItems_(s) {
+  if (Array.isArray(s)) return s;
+  try { const a = JSON.parse(s || '[]'); return Array.isArray(a) ? a : []; } catch (e) { return []; }
+}
+
+function calcTotais_(d, comCusto) {
+  const itens = parseItems_(d.itens);
+  itens.forEach(function (it) {
+    if (!it || typeof it !== 'object') throw new Error('Há um item inválido no orçamento/OS.');
+    it.qtd = num_(it.qtd);
+    it.valorUnit = num_(it.valorUnit);
+    if (it.qtd <= 0) throw new Error('A quantidade de cada item deve ser maior que zero.');
+    if (it.valorUnit < 0) throw new Error('O valor unitário não pode ser negativo.');
+    if (!String(it.descricao || '').trim() && !it.materialId && !it.atividadeId) throw new Error('Informe a descrição ou selecione um material/atividade para cada item.');
+    if (it.tipo === 'Material' && !it.materialId) throw new Error('Selecione o material de cada item do tipo Material.');
+  });
+  d.itens = JSON.stringify(itens);
+  const sub = itens.reduce(function (s, it) { return s + num_(it.qtd) * num_(it.valorUnit); }, 0);
+  d.subtotal = round2_(sub);
+  d.desconto = num_(d.desconto);
+  if (d.desconto < 0) throw new Error('O desconto não pode ser negativo.');
+  if (d.desconto > d.subtotal) throw new Error('O desconto não pode ser maior que o subtotal.');
+  d.total = round2_(d.subtotal - d.desconto);
+  if (comCusto) {
+    const mats = {};
+    readAll_('materiais').forEach(function (m) { mats[m.id] = m; });
+    let custo = 0;
+    itens.forEach(function (it) {
+      if (it.tipo === 'Material' && it.materialId) {
+        if (!mats[it.materialId]) throw new Error('Um material desta OS não existe mais no cadastro. Revise os itens.');
+        custo += num_(it.qtd) * num_(mats[it.materialId].custo);
+      }
+    });
+    d.custoMateriais = round2_(custo);
+  }
+}
+
+/** { materialId: quantidade total } dos itens do tipo Material. */
+function somaMateriais_(itens) {
+  const out = {};
+  parseItems_(itens).forEach(function (it) {
+    if (it && it.tipo === 'Material' && it.materialId) out[it.materialId] = round3_((out[it.materialId] || 0) + num_(it.qtd));
+  });
+  return out;
+}
+
+/** Confere só quando entra num status ativo, é novo ou os itens mudaram (editar a observação não trava). */
+function precisaConferirEstoque_(d, prev, statusAtivos) {
+  if (statusAtivos.indexOf(d.status) < 0) return false;
+  if (!prev || statusAtivos.indexOf(prev.status) < 0) return true;
+  return JSON.stringify(somaMateriais_(d.itens)) !== JSON.stringify(somaMateriais_(prev.itens));
+}
+
+/** Quanto cada material tem reservado em OS abertas/em andamento (que ainda não baixaram o estoque). */
+function reservasEstoque_(ignorarOsId) {
+  const out = {};
+  readAll_('os').forEach(function (o) {
+    if (o.id === ignorarOsId || STATUS_RESERVA_ESTOQUE.indexOf(o.status) < 0) return;
+    const soma = somaMateriais_(o.itens);
+    Object.keys(soma).forEach(function (mid) {
+      if (!out[mid]) out[mid] = { qtd: 0, os: [] };
+      out[mid].qtd = round3_(out[mid].qtd + soma[mid]);
+      out[mid].os.push(o.id);
+    });
+  });
+  return out;
+}
+
+/**
+ * Impede orçar ou abrir OS com mais material do que o disponível.
+ * Disponível = estoque atual − reservado por outras OS abertas/em andamento.
+ */
+function validarDisponibilidade_(itens, ignorarOsId, origem) {
+  const pedido = somaMateriais_(itens);
+  const ids = Object.keys(pedido);
+  if (!ids.length) return;
+  const mats = {};
+  readAll_('materiais').forEach(function (m) { mats[m.id] = m; });
+  const reservas = reservasEstoque_(ignorarOsId);
+  const erros = [];
+  ids.forEach(function (mid) {
+    const m = mats[mid];
+    if (!m) { erros.push('O material ' + mid + ' não existe mais no cadastro. Remova-o dos itens.'); return; }
+    const un = m.unidade || 'un';
+    const estoque = num_(m.estoqueAtual);
+    const res = reservas[mid] || { qtd: 0, os: [] };
+    const disp = Math.max(0, round3_(estoque - res.qtd));
+    if (pedido[mid] > disp) {
+      erros.push(m.nome + ': solicitado ' + pedido[mid] + ' ' + un + ', disponível ' + disp + ' ' + un +
+        ' (em estoque ' + estoque + (res.qtd ? ', reservado ' + res.qtd + ' em ' + res.os.join(', ') : '') + ').');
+    }
+  });
+  if (erros.length) throw new Error((origem ? origem + ' bloqueado — ' : '') + 'estoque insuficiente:\n• ' + erros.join('\n• '));
+}
+
+/**
+ * Mantém o estoque coerente com a OS. Guarda uma "foto" do que já foi baixado
+ * (coluna oculta) e ajusta apenas a diferença a cada salvamento:
+ *  - OS Concluída/Faturada consome os materiais dos itens;
+ *  - editar itens depois ajusta a diferença;
+ *  - voltar/cancelar ou excluir devolve o consumo ao estoque.
+ */
+function syncEstoqueOS_(os, user) {
+  const baixar = STATUS_BAIXA_ESTOQUE.indexOf(os.status) >= 0;
+  const desejado = {};
+  if (baixar) {
+    parseItems_(os.itens).forEach(function (it) {
+      if (it.tipo === 'Material' && it.materialId) desejado[it.materialId] = round3_((desejado[it.materialId] || 0) + num_(it.qtd));
+    });
+  }
+  let atual = {};
+  try { atual = JSON.parse(os.materiaisBaixados || '{}') || {}; } catch (e) { atual = {}; }
+  const ids = Object.keys(desejado).concat(Object.keys(atual)).filter(function (v, i, a) { return a.indexOf(v) === i; });
+  const mudancas = ids.map(function (mid) {
+    return { id: mid, delta: round3_((desejado[mid] || 0) - (atual[mid] || 0)) };
+  });
+  mudancas.forEach(function (mudanca) {
+    if (mudanca.delta <= 0) return;
+    const material = findById_('materiais', mudanca.id);
+    if (!material) throw new Error('Um material desta OS não existe mais no cadastro. Revise os itens.');
+    if (num_(material.data.estoqueAtual) < mudanca.delta) {
+      throw new Error('Estoque insuficiente para ' + material.data.nome + '. Disponível: ' + num_(material.data.estoqueAtual) + ', necessário: ' + mudanca.delta + '.');
+    }
+  });
+  mudancas.forEach(function (mudanca) {
+    const mid = mudanca.id, delta = mudanca.delta;
+    if (delta !== 0) ajustarEstoque_(mid, -delta, delta > 0 ? 'Saída' : 'Estorno', os.id, user);
+  });
+  os.materiaisBaixados = JSON.stringify(desejado);
+}
+
+function ajustarEstoque_(materialId, delta, tipo, origem, user) {
+  const m = findById_('materiais', materialId);
+  if (!m) return; // material excluído: ignora
+  const novo = round3_(num_(m.data.estoqueAtual) + delta);
+  m.data.estoqueAtual = novo;
+  writeRow_('materiais', m.data, m.row);
+  marcarSalvo_('materiais', m.data);
+  logMov_(m.data, tipo, delta, novo, origem, user);
+}
+
+function logMov_(mat, tipo, delta, saldo, origem, user) {
+  const movimentacao = {
+    id: nextId_('movimentacoes'), data: new Date(), materialId: mat.id, material: mat.nome,
+    tipo: tipo, quantidade: delta, saldo: saldo, origem: origem, usuario: user.id
+  };
+  writeRow_('movimentacoes', movimentacao, null);
+  marcarSalvo_('movimentacoes', movimentacao);
+  notificarEstoqueMinimo_(mat, movimentacao, user);
+}
+
+function notificarEstoqueMinimo_(mat, movimentacao, user) {
+  const delta = num_(movimentacao.quantidade);
+  const saldo = num_(movimentacao.saldo);
+  const anterior = round3_(saldo - delta);
+  const minimo = num_(mat.estoqueMin);
+  if (delta >= 0 || anterior < minimo || saldo >= minimo) return;
+
+  const destinatarios = readAll_('usuarios').filter(function (u) {
+    return u.ativo !== 'Não' && u.recebeEmailEstoque === 'Sim' && /^\S+@\S+\.\S+$/.test(String(u.email || '').trim());
+  });
+  if (!destinatarios.length) {
+    registrarUltimoAlerta_('erro', String(mat.nome || mat.id), 'Alerta NÃO enviado: nenhum usuário ativo com "Receber alertas de estoque" marcado e e-mail válido.');
+    return;
+  }
+
+  let operador = user || {};
+  if (user && user.id && user.id !== 'MESTRE') {
+    const registro = findById_('usuarios', user.id);
+    if (registro) operador = registro.data;
+  }
+
+  let cota;
+  try { cota = MailApp.getRemainingDailyQuota(); }
+  catch (e) {
+    Logger.log('Não foi possível consultar a cota de e-mail: ' + e.message);
+    registrarUltimoAlerta_('erro', String(mat.nome || mat.id), 'Alerta NÃO enviado: ' + explicarErroEmail_(e));
+    return;
+  }
+  if (cota < destinatarios.length) {
+    Logger.log('Alerta de estoque não enviado: cota diária insuficiente para todos os destinatários.');
+    registrarUltimoAlerta_('erro', String(mat.nome || mat.id), 'Alerta NÃO enviado: cota diária insuficiente (restam ' + cota + ', precisa de ' + destinatarios.length + ').');
+    return;
+  }
+
+  const quantidade = Math.abs(delta);
+  const assunto = APP.nome + ' - Estoque abaixo do mínimo: ' + String(mat.nome || mat.id);
+  const mensagem = [
+    'Uma movimentação deixou o material abaixo do estoque mínimo.',
+    '',
+    'MATERIAL',
+    'Nome: ' + String(mat.nome || '—'),
+    'ID: ' + String(mat.id || '—'),
+    'SKU: ' + String(mat.sku || '—'),
+    'Categoria: ' + String(mat.categoria || '—'),
+    'Unidade: ' + String(mat.unidade || '—'),
+    '',
+    'MOVIMENTAÇÃO',
+    'ID: ' + String(movimentacao.id || '—'),
+    'Tipo: ' + String(movimentacao.tipo || '—'),
+    'Quantidade movimentada: ' + quantidade,
+    'Origem / observação: ' + String(movimentacao.origem || '—'),
+    'Estoque anterior: ' + anterior,
+    'Estoque mínimo: ' + minimo,
+    'Estoque atual: ' + saldo,
+    'Data e hora: ' + Utilities.formatDate(movimentacao.data, tz_(), 'dd/MM/yyyy HH:mm:ss'),
+    '',
+    'USUÁRIO QUE REALIZOU A OPERAÇÃO',
+    'Nome: ' + String(operador.nome || operador.id || 'Não identificado'),
+    'ID: ' + String(operador.id || '—'),
+    'Perfil: ' + String(operador.perfil || '—'),
+    'E-mail: ' + String(operador.email || '—')
+  ].join('\n');
+
+  const falhas = [];
+  destinatarios.forEach(function (destinatario) {
+    try {
+      MailApp.sendEmail({ to: String(destinatario.email).trim(), subject: assunto, body: mensagem });
+    } catch (e) {
+      Logger.log('Falha ao enviar alerta de estoque para ' + destinatario.id + ': ' + e.message);
+      falhas.push(String(destinatario.email).trim() + ': ' + explicarErroEmail_(e));
+    }
+  });
+  registrarUltimoAlerta_(falhas.length ? 'erro' : 'ok', String(mat.nome || mat.id),
+    falhas.length ? falhas.join(' | ') : 'Enviado para ' + destinatarios.length + ' destinatário(s).');
+}
+
+/* ============================================================================
+ *  TESTE MANUAL DE E-MAIL — diagnóstico passo a passo (tela Configurações)
+ * ========================================================================== */
+function registrarUltimoAlerta_(status, material, detalhe) {
+  try {
+    PropertiesService.getScriptProperties().setProperty('ULTIMO_ALERTA_EMAIL', JSON.stringify({
+      quando: Utilities.formatDate(new Date(), tz_(), 'dd/MM/yyyy HH:mm:ss'),
+      status: status, material: material, detalhe: detalhe
+    }));
+  } catch (e) { Logger.log('Não foi possível registrar o status do alerta: ' + e.message); }
+}
+
+/** Link que vai no e-mail: o configurado (ex.: seu site com o index.html) ou o do App da Web. */
+function linkAcesso_() {
+  const cfg = getConfig_();
+  const link = String(cfg.link_acesso || '').trim();
+  if (link) return link;
+  try { return ScriptApp.getService().getUrl().replace(/\/dev$/, '/exec'); } catch (e) { return ''; }
+}
+
+/**
+ * E-mail com usuário, senha e link para quem acabou de ser cadastrado.
+ * Nunca impede o cadastro: devolve { ok, msg } para a tela avisar o resultado.
+ */
+function enviarBoasVindas_(u, senha) {
+  const email = String((u && u.email) || '').trim();
+  if (!email) return { ok: false, msg: 'Usuário criado, mas sem e-mail no cadastro: os dados de acesso NÃO foram enviados. Informe-os pessoalmente.' };
+  if (!senha) return { ok: false, msg: 'Usuário criado, mas sem senha digitada: os dados de acesso NÃO foram enviados.' };
+  try {
+    if (MailApp.getRemainingDailyQuota() < 1) {
+      return { ok: false, msg: 'Usuário criado, mas a cota diária de e-mails acabou: os dados de acesso NÃO foram enviados para ' + email + '. Tente reenviar amanhã ou informe-os pessoalmente.' };
+    }
+    const cfg = getConfig_();
+    const empresa = String(cfg.empresa_nome || APP.nome);
+    const link = linkAcesso_();
+    const linhaLink = link ? 'Link de acesso: ' + link : 'Link de acesso: peça ao administrador.';
+    const texto = [
+      'Olá, ' + u.nome + '!', '',
+      'Seu acesso ao ' + APP.nome + ' (' + empresa + ') foi criado.', '',
+      'Usuário: ' + u.nome,
+      'Senha: ' + senha,
+      'Perfil: ' + u.perfil,
+      linhaLink, '',
+      'Por segurança, troque a senha no primeiro acesso: clique no ícone de perfil, ao lado do seu nome, no menu lateral.',
+      'Se você não esperava este e-mail, ignore-o.'
+    ].join('\n');
+    const td = 'padding:10px 14px;border-bottom:1px solid #E4E8EE;font-size:14px';
+    const html =
+      '<div style="background:#F7F9FB;padding:28px 12px;font-family:Segoe UI,Arial,sans-serif;color:#0F1B2B">' +
+      '<div style="max-width:520px;margin:0 auto;background:#fff;border:1px solid #E4E8EE;border-radius:14px;overflow:hidden">' +
+      '<div style="background:#0F1B2B;padding:20px 24px;color:#fff;font-size:18px;font-weight:700;letter-spacing:1px">' + esc_(APP.nome) +
+      '<div style="font-size:12px;font-weight:400;color:#F59E1B;letter-spacing:0;margin-top:2px">' + esc_(empresa) + '</div></div>' +
+      '<div style="padding:24px">' +
+      '<p style="margin:0 0 6px;font-size:16px;font-weight:600">Olá, ' + esc_(u.nome) + '!</p>' +
+      '<p style="margin:0 0 18px;font-size:14px;color:#33465C">Seu acesso ao sistema foi criado. Estes são os seus dados de entrada:</p>' +
+      '<table style="width:100%;border-collapse:collapse;border:1px solid #E4E8EE;border-radius:10px">' +
+      '<tr><td style="' + td + ';color:#5E7184;width:90px">Usuário</td><td style="' + td + ';font-weight:700">' + esc_(u.nome) + '</td></tr>' +
+      '<tr><td style="' + td + ';color:#5E7184">Senha</td><td style="' + td + ';font-weight:700;font-family:Consolas,monospace">' + esc_(senha) + '</td></tr>' +
+      '<tr><td style="' + td + ';color:#5E7184;border-bottom:none">Perfil</td><td style="' + td + ';border-bottom:none">' + esc_(u.perfil) + '</td></tr></table>' +
+      (link ? '<div style="text-align:center;margin:24px 0 8px"><a href="' + esc_(link) + '" style="display:inline-block;background:#EE7B12;color:#fff;text-decoration:none;font-weight:700;padding:12px 28px;border-radius:999px">Acessar o sistema</a></div>' +
+        '<p style="margin:0 0 18px;text-align:center;font-size:12px;color:#5E7184;word-break:break-all">' + esc_(link) + '</p>' : '') +
+      '<p style="margin:0;font-size:13px;color:#33465C;background:#FDEBD4;border-radius:8px;padding:10px 12px"><b>Por segurança</b>, troque a senha no primeiro acesso: clique no ícone de perfil, ao lado do seu nome, no menu lateral.</p>' +
+      '</div><div style="padding:14px 24px;border-top:1px solid #E4E8EE;font-size:11px;color:#8A97A3">Se você não esperava este e-mail, ignore-o.</div></div></div>';
+    MailApp.sendEmail({ to: email, subject: 'Seu acesso ao ' + APP.nome + ' — ' + empresa, body: texto, htmlBody: html, name: APP.nome });
+    return { ok: true, msg: 'Usuário criado e dados de acesso enviados para ' + email + '.' };
+  } catch (e) {
+    return { ok: false, msg: 'Usuário criado, mas o e-mail de acesso NÃO foi enviado para ' + email + '. Motivo: ' + explicarErroEmail_(e) };
+  }
+}
+
+/** Traduz os erros do MailApp para uma causa + o que fazer. */
+function explicarErroEmail_(e) {
+  const msg = String((e && e.message) || e);
+  const m = msg.toLowerCase();
+  let causa;
+  if (/permission|permiss|authoriz|autoriza|script\.send_mail|required permissions/.test(m)) {
+    causa = 'A conta dona do script ainda não autorizou o envio de e-mails (o Google exige esse clique uma única vez). Logado como dono, abra a planilha e use o menu ' + APP.nome + ' > "Autorizar envio de e-mails" (ou rode autorizarEnvioEmails() no editor) e clique em "Permitir". Se a tela de permissão não pedir e-mail, verifique se o appsscript.json tem uma lista "oauthScopes" fixa: nesse caso inclua "https://www.googleapis.com/auth/script.send_mail" nela.';
+  } else if (/too many times|limit exceeded|quota|cota|limite/.test(m)) {
+    causa = 'A cota diária de e-mails do Google acabou (contas gratuitas: ~100 destinatários/dia; Workspace: ~1500). Ela é renovada em 24 h.';
+  } else if (/invalid email|invalid argument|e-mail inválido|invalid recipient/.test(m)) {
+    causa = 'O endereço do destinatário foi recusado pelo Google (formato inválido ou domínio inexistente). Confira o e-mail digitado.';
+  } else if (/service unavailable|server error|internal error|try again|timed out|timeout/.test(m)) {
+    causa = 'Instabilidade temporária no serviço de e-mail do Google. Tente novamente em alguns minutos.';
+  } else if (/disabled|desativad|suspend/.test(m)) {
+    causa = 'O envio de e-mails está bloqueado para a conta dona do script (conta suspensa ou Gmail desativado pelo administrador do Workspace).';
+  } else {
+    causa = 'Erro não mapeado retornado pelo Google.';
+  }
+  return causa + ' [Mensagem original: ' + msg + ']';
+}
+
+/**
+ * Dispara um e-mail de teste e devolve cada etapa com ok/erro e a causa exata.
+ * destino vazio = envia para todos os usuários marcados para receber alertas de estoque.
+ */
+function api_testarEmail(destino, creds) {
+  return guard_(function () {
+    const user = currentUser_(creds);
+    needAdmin_(user, creds);
+
+    const etapas = [];
+    const passo = function (nome, ok, detalhe) { etapas.push({ nome: nome, ok: ok, detalhe: detalhe }); return ok; };
+    const fim = function () {
+      let ultimo = null;
+      try { ultimo = JSON.parse(PropertiesService.getScriptProperties().getProperty('ULTIMO_ALERTA_EMAIL') || 'null'); } catch (e) {}
+      return { sucesso: etapas.every(function (x) { return x.ok; }), etapas: etapas, ultimoAlerta: ultimo };
+    };
+
+    // 1. Conta remetente
+    let remetente = '';
+    try { remetente = String(Session.getEffectiveUser().getEmail() || ''); } catch (e) {}
+    passo('Conta remetente', true, remetente
+      ? 'Os e-mails saem da conta ' + remetente + ' (dono da implantação).'
+      : 'Não foi possível identificar a conta que envia (normal em algumas implantações); o envio usa a conta dona do script.');
+
+    // 2. Permissão + cota (getRemainingDailyQuota exige o mesmo escopo do envio)
+    let cota;
+    try { cota = MailApp.getRemainingDailyQuota(); }
+    catch (e) { passo('Permissão de envio (MailApp)', false, explicarErroEmail_(e)); return fim(); }
+    passo('Permissão de envio (MailApp)', true, 'Script autorizado a enviar e-mails.');
+
+    // 3. Destinatários
+    let lista = [];
+    const alvo = String(destino || '').trim();
+    if (alvo) {
+      if (!/^\S+@\S+\.\S+$/.test(alvo)) { passo('Destinatário', false, 'O endereço "' + alvo + '" não tem formato de e-mail válido (ex.: nome@dominio.com).'); return fim(); }
+      lista = [alvo];
+      passo('Destinatário', true, 'Envio manual para ' + alvo + '.');
+    } else {
+      const usuarios = readAll_('usuarios');
+      const marcados = usuarios.filter(function (u) { return u.recebeEmailEstoque === 'Sim'; });
+      const problemas = [];
+      marcados.forEach(function (u) {
+        const em = String(u.email || '').trim();
+        if (u.ativo === 'Não') problemas.push(u.nome + ' está INATIVO (não recebe).');
+        else if (!/^\S+@\S+\.\S+$/.test(em)) problemas.push(u.nome + ' está marcado mas o e-mail "' + em + '" é inválido ou vazio.');
+        else lista.push(em);
+      });
+      if (!marcados.length) {
+        passo('Destinatários dos alertas de estoque', false, 'Nenhum usuário está com "Receber alertas de estoque por e-mail" marcado. Os alertas automáticos NUNCA são enviados enquanto isso não for marcado em Usuários (com um e-mail preenchido). Para testar mesmo assim, digite um e-mail no campo.');
+        return fim();
+      }
+      if (!lista.length) {
+        passo('Destinatários dos alertas de estoque', false, 'Há usuários marcados, mas nenhum apto: ' + problemas.join(' '));
+        return fim();
+      }
+      passo('Destinatários dos alertas de estoque', true, lista.length + ' apto(s): ' + lista.join(', ') + (problemas.length ? '. Atenção: ' + problemas.join(' ') : ''));
+    }
+
+    // 4. Cota suficiente
+    if (cota < lista.length) {
+      passo('Cota diária', false, 'Restam ' + cota + ' envio(s) hoje e o teste precisa de ' + lista.length + '. ' +
+        'Contas gratuitas do Gmail têm ~100 destinatários/dia (Workspace ~1500); a cota renova em 24 h. Os alertas automáticos também são bloqueados nesse caso.');
+      return fim();
+    }
+    passo('Cota diária', true, 'Restam ' + cota + ' envio(s) hoje.');
+
+    // 5. Envio
+    const quando = Utilities.formatDate(new Date(), tz_(), 'dd/MM/yyyy HH:mm:ss');
+    lista.forEach(function (em) {
+      try {
+        MailApp.sendEmail({
+          to: em,
+          subject: APP.nome + ' - E-mail de teste (' + quando + ')',
+          body: 'Este é um e-mail de TESTE disparado manualmente em Configurações.\n\n' +
+            'Se você recebeu esta mensagem, o envio de e-mails do sistema está funcionando.\n\n' +
+            'Disparado por: ' + String(user.nome || user.id) + '\nData e hora: ' + quando +
+            (remetente ? '\nConta remetente: ' + remetente : '')
+        });
+        passo('Envio para ' + em, true, 'Aceito pelo Google. Se não chegar em alguns minutos, verifique a caixa de SPAM/Lixo eletrônico e a aba Promoções.');
+      } catch (e) {
+        passo('Envio para ' + em, false, explicarErroEmail_(e));
+      }
+    });
+    try { passo('Cota após o teste', true, 'Restam ' + MailApp.getRemainingDailyQuota() + ' envio(s) hoje.'); } catch (e) {}
+    return fim();
+  });
+}
+
+/* ============================================================================
+ *  CONFIG E UTILITÁRIOS
+ * ========================================================================== */
+/** Configurações com cache (memória da execução + CacheService por 5 min). */
+let CFG_MEMO_ = null;
+function getConfig_() {
+  if (CFG_MEMO_) return Object.assign({}, CFG_MEMO_);
+  try {
+    const c = CacheService.getScriptCache().get('CFG_V1');
+    if (c) { CFG_MEMO_ = JSON.parse(c); return Object.assign({}, CFG_MEMO_); }
+  } catch (e) {}
+  const cfg = {};
+  CONFIG_PADRAO.forEach(function (p) { cfg[p[0]] = p[1]; });
+  const sh = getAba_(getSS_(), 'Config');
+  if (sh && sh.getLastRow() > 1) {
+    sh.getRange(2, 1, sh.getLastRow() - 1, 2).getValues().forEach(function (r) { if (r[0]) cfg[r[0]] = r[1] === null ? '' : String(r[1]); });
+  }
+  CFG_MEMO_ = cfg;
+  try { CacheService.getScriptCache().put('CFG_V1', JSON.stringify(cfg), 300); } catch (e) {}
+  return Object.assign({}, cfg);
+}
+
+function limparCacheConfig_() {
+  CFG_MEMO_ = null;
+  try { CacheService.getScriptCache().remove('CFG_V1'); } catch (e) {}
+}
+
+function rng_(entity, key) {
+  const def = SCHEMA[entity];
+  const c = def.cols.filter(function (x) { return x.k === key; })[0];
+  const sh = getAba_(getSS_(), def.sheet);
+  const L = letter_(headerMap_(sh)[c.l] + 1);
+  return "'" + def.sheet + "'!" + L + '2:' + L;
+}
+
+function letter_(n) {
+  let s = '';
+  while (n > 0) { const m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = Math.floor((n - 1) / 26); }
+  return s;
+}
+
+function tz_() { return Session.getScriptTimeZone(); }
+function hoje_() { return Utilities.formatDate(new Date(), tz_(), 'yyyy-MM-dd'); }
+function addDays_(s, n) {
+  const p = s.split('-');
+  return Utilities.formatDate(new Date(+p[0], +p[1] - 1, +p[2] + n), tz_(), 'yyyy-MM-dd');
+}
+function num_(v) { const n = Number(String(v === undefined || v === null ? '' : v).replace(',', '.')); return isNaN(n) ? 0 : n; }
+function round2_(n) { return Math.round((n + Number.EPSILON) * 100) / 100; }
+function round3_(n) { return Math.round((n + Number.EPSILON) * 1000) / 1000; }
+function esc_(s) {
+  return String(s === undefined || s === null ? '' : s).replace(/[&<>"']/g, function (ch) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch];
+  });
+}
+function fmtMoney_(n) {
+  const v = Number(n) || 0;
+  return (v < 0 ? '-' : '') + 'R$ ' + Math.abs(v).toFixed(2).replace('.', ',').replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+}
+function fmtData_(s) {
+  const m = String(s || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+  return m ? m[3] + '/' + m[2] + '/' + m[1] : (s || '');
+}
